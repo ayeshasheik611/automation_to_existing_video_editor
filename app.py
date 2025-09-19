@@ -10,49 +10,436 @@ from flask_sqlalchemy import SQLAlchemy
 import time
 import subprocess
 import sys
-import moviepy.config as mp_config
 import json
 import requests
 from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import SentenceTransformer
+try:
+    from sentence_transformers import util
+except ImportError:
+    import sentence_transformers.util as util
 import numpy as np
 import yt_dlp
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from bs4 import BeautifulSoup
 import re
-import gc  # Add this at the top with other imports
+import gc
 from concurrent.futures import ThreadPoolExecutor
 import cv2
-import math
-from moviepy.video.fx import all as vfx
-from PIL import Image, ImageEnhance
-import psutil
-import os
-from moviepy.editor import (
-    VideoFileClip,
-    TextClip,  # Add this import
-    ImageClip,  # Add this import
-    CompositeVideoClip,
-    concatenate_videoclips,
-    vfx
-)
-
-process = psutil.Process(os.getpid())
-mem_info = process.memory_info()
-print(f"Memory usage: {mem_info.rss / (1024 * 1024):.2f} MB")
 
 # Load environment variables
 load_dotenv()
 
-# Define ImageMagick path
+# Define ImageMagick path for Windows
 IMAGEMAGICK_PATH = r"C:\Program Files\ImageMagick-7.1.1-Q16-HDRI\magick.exe"
 
-# Add this after other API configurations
+# API configurations
 PEXELS_API_KEY = os.getenv('PEXELS_API_KEY')
+
+# Setup ImageMagick for moviepy
+def setup_imagemagick():
+    """Setup ImageMagick configuration."""
+    import moviepy.config as mp_config
+    if os.path.exists(IMAGEMAGICK_PATH):
+        mp_config.change_settings({"IMAGEMAGICK_BINARY": IMAGEMAGICK_PATH})
+        return True
+    
+    # Try to find ImageMagick in PATH
+    try:
+        result = subprocess.run(['where', 'magick'], capture_output=True, text=True)
+        if result.returncode == 0:
+            magick_path = result.stdout.strip().split('\n')[0]
+            mp_config.change_settings({"IMAGEMAGICK_BINARY": magick_path})
+            return True
+    except Exception:
+        pass
+    
+    print("WARNING: ImageMagick not found. Some features may not work.")
+    return False
+
+# Setup ImageMagick at startup
+imagemagick_configured = setup_imagemagick()
+
+# FFmpeg utility functions for direct video processing
+def compress_video_ffmpeg(input_path, output_path, crf=23, preset='medium'):
+    """
+    Compress video using direct FFmpeg command for better performance
+    """
+    try:
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-c:v', 'libx264',
+            '-preset', preset,
+            '-crf', str(crf),
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-movflags', '+faststart',
+            '-y',  # Overwrite output file
+            output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode != 0:
+            print(f"FFmpeg error: {result.stderr}")
+            return False, f"FFmpeg error: {result.stderr}"
+        
+        return True, "Video compressed successfully"
+        
+    except subprocess.TimeoutExpired:
+        return False, "Video processing timeout"
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def trim_video_ffmpeg(input_path, output_path, start_time, end_time):
+    """
+    Trim video using direct FFmpeg for faster processing
+    """
+    try:
+        duration = end_time - start_time
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-ss', str(start_time),
+            '-t', str(duration),
+            '-c', 'copy',  # Copy streams without re-encoding for speed
+            '-avoid_negative_ts', 'make_zero',
+            '-y',
+            output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        
+        if result.returncode != 0:
+            print(f"FFmpeg trim error: {result.stderr}")
+            return False, f"FFmpeg error: {result.stderr}"
+        
+        return True, "Video trimmed successfully"
+        
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def merge_videos_ffmpeg(input_paths, output_path):
+    """
+    Merge videos using direct FFmpeg for better performance
+    """
+    try:
+        # Create a temporary file list for FFmpeg concat
+        list_file = os.path.join(app.config['UPLOAD_FOLDER'], f'filelist_{int(time.time())}.txt')
+        
+        with open(list_file, 'w') as f:
+            for path in input_paths:
+                f.write(f"file '{path}'\n")
+        
+        cmd = [
+            'ffmpeg', '-f', 'concat', '-safe', '0',
+            '-i', list_file,
+            '-c', 'copy',
+            '-y',
+            output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        # Clean up list file
+        if os.path.exists(list_file):
+            os.remove(list_file)
+        
+        if result.returncode != 0:
+            print(f"FFmpeg merge error: {result.stderr}")
+            return False, f"FFmpeg error: {result.stderr}"
+        
+        return True, "Videos merged successfully"
+        
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def check_ffmpeg():
+    """Check if FFmpeg is available"""
+    try:
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
+        if result.returncode == 0:
+            print("FFmpeg is available and working")
+            return True
+    except FileNotFoundError:
+        print("WARNING: FFmpeg not found. Please install FFmpeg for optimal performance.")
+    return False
+
+# Check FFmpeg availability at startup
+ffmpeg_available = check_ffmpeg()
+
+# Comprehensive FFmpeg functions for all video operations
+def resize_video_ffmpeg(input_path, output_path, width, height):
+    """Resize video using FFmpeg"""
+    try:
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vf', f'scale={width}:{height}',
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-movflags', '+faststart',
+            '-y', output_path
+        ]
+        return run_ffmpeg_command(cmd)
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def change_speed_ffmpeg(input_path, output_path, speed_factor):
+    """Change video speed using FFmpeg"""
+    try:
+        # For video speed
+        video_speed = speed_factor
+        # For audio speed (to maintain sync)
+        audio_speed = speed_factor
+        
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-filter_complex', f'[0:v]setpts={1/video_speed}*PTS[v];[0:a]atempo={audio_speed}[a]',
+            '-map', '[v]', '-map', '[a]',
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-movflags', '+faststart',
+            '-y', output_path
+        ]
+        return run_ffmpeg_command(cmd)
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def extract_audio_ffmpeg(input_path, output_path):
+    """Extract audio using FFmpeg"""
+    try:
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vn',  # No video
+            '-acodec', 'mp3',
+            '-ab', '192k',
+            '-ar', '44100',
+            '-y', output_path
+        ]
+        return run_ffmpeg_command(cmd)
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def apply_fade_ffmpeg(input_path, output_path, fade_in_duration=1, fade_out_duration=1):
+    """Apply fade in/out using FFmpeg"""
+    try:
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vf', f'fade=in:0:{fade_in_duration*30},fade=out:st={fade_in_duration}:d={fade_out_duration}',
+            '-af', f'afade=in:st=0:d={fade_in_duration},afade=out:st={fade_out_duration}:d={fade_out_duration}',
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-movflags', '+faststart',
+            '-y', output_path
+        ]
+        return run_ffmpeg_command(cmd)
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def apply_blur_ffmpeg(input_path, output_path, blur_strength=5):
+    """Apply blur effect using FFmpeg"""
+    try:
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vf', f'boxblur={blur_strength}:{blur_strength}',
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-c:a', 'copy',
+            '-movflags', '+faststart',
+            '-y', output_path
+        ]
+        return run_ffmpeg_command(cmd)
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def apply_brightness_contrast_ffmpeg(input_path, output_path, brightness=0, contrast=1):
+    """Apply brightness and contrast using FFmpeg"""
+    try:
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vf', f'eq=brightness={brightness}:contrast={contrast}',
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-c:a', 'copy',
+            '-movflags', '+faststart',
+            '-y', output_path
+        ]
+        return run_ffmpeg_command(cmd)
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def apply_saturation_ffmpeg(input_path, output_path, saturation=1):
+    """Apply saturation using FFmpeg"""
+    try:
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vf', f'eq=saturation={saturation}',
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-c:a', 'copy',
+            '-movflags', '+faststart',
+            '-y', output_path
+        ]
+        return run_ffmpeg_command(cmd)
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def apply_grayscale_ffmpeg(input_path, output_path):
+    """Convert to grayscale using FFmpeg"""
+    try:
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vf', 'format=gray',
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-c:a', 'copy',
+            '-movflags', '+faststart',
+            '-y', output_path
+        ]
+        return run_ffmpeg_command(cmd)
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def add_overlay_ffmpeg(main_path, overlay_path, output_path, x=0, y=0, width=None, height=None, duration=None, start_time=0):
+    """Add overlay using FFmpeg - supports both video and image overlays"""
+    try:
+        # Check if overlay is an image or video
+        overlay_ext = os.path.splitext(overlay_path)[1].lower()
+        is_image = overlay_ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp']
+        
+        if is_image:
+            # Handle image overlay
+            if width and height:
+                scale_filter = f'scale={width}:{height}'
+            elif width:
+                scale_filter = f'scale={width}:-1'
+            elif height:
+                scale_filter = f'scale=-1:{height}'
+            else:
+                scale_filter = 'scale=iw:ih'
+            
+            # For images, we need to loop them for the duration
+            if duration:
+                filter_complex = f'[1:v]loop=loop=-1:size=1:start=0,{scale_filter}[ovr];[0:v][ovr]overlay={x}:{y}:enable=\'between(t,{start_time},{start_time + duration})\'[out]'
+            else:
+                filter_complex = f'[1:v]loop=loop=-1:size=1:start=0,{scale_filter}[ovr];[0:v][ovr]overlay={x}:{y}[out]'
+        else:
+            # Handle video overlay
+            if width and height:
+                scale_filter = f'scale={width}:{height}'
+            elif width:
+                scale_filter = f'scale={width}:-1'
+            elif height:
+                scale_filter = f'scale=-1:{height}'
+            else:
+                scale_filter = 'scale=iw:ih'
+            
+            if duration:
+                filter_complex = f'[1:v]{scale_filter}[ovr];[0:v][ovr]overlay={x}:{y}:enable=\'between(t,{start_time},{start_time + duration})\'[out]'
+            else:
+                filter_complex = f'[1:v]{scale_filter}[ovr];[0:v][ovr]overlay={x}:{y}[out]'
+        
+        cmd = [
+            'ffmpeg', '-i', main_path, '-i', overlay_path,
+            '-filter_complex', filter_complex,
+            '-map', '[out]', '-map', '0:a?',
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-movflags', '+faststart',
+            '-y', output_path
+        ]
+        return run_ffmpeg_command(cmd)
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def add_image_overlay_ffmpeg(main_path, image_path, output_path, x=0, y=0, width=None, height=None, duration=None, start_time=0, opacity=1.0):
+    """Add image overlay with advanced options using FFmpeg"""
+    try:
+        # Build scale filter
+        if width and height:
+            scale_filter = f'scale={width}:{height}'
+        elif width:
+            scale_filter = f'scale={width}:-1'
+        elif height:
+            scale_filter = f'scale=-1:{height}'
+        else:
+            scale_filter = 'scale=iw:ih'
+        
+        # Build opacity filter
+        if opacity < 1.0:
+            opacity_filter = f',format=rgba,colorchannelmixer=aa={opacity}'
+        else:
+            opacity_filter = ''
+        
+        # Build time filter
+        if duration:
+            time_filter = f':enable=\'between(t,{start_time},{start_time + duration})\''
+        else:
+            time_filter = ''
+        
+        filter_complex = f'[1:v]loop=loop=-1:size=1:start=0,{scale_filter}{opacity_filter}[ovr];[0:v][ovr]overlay={x}:{y}{time_filter}[out]'
+        
+        cmd = [
+            'ffmpeg', '-i', main_path, '-i', image_path,
+            '-filter_complex', filter_complex,
+            '-map', '[out]', '-map', '0:a?',
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-movflags', '+faststart',
+            '-y', output_path
+        ]
+        return run_ffmpeg_command(cmd)
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def validate_image_file(file_path):
+    """Validate if a file is a supported image format"""
+    try:
+        if not os.path.exists(file_path):
+            return False, "Image file does not exist"
+        
+        # Check file extension
+        ext = os.path.splitext(file_path)[1].lower()
+        supported_formats = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp']
+        
+        if ext not in supported_formats:
+            return False, f"Unsupported image format: {ext}. Supported: {', '.join(supported_formats)}"
+        
+        # Check file size
+        file_size = os.path.getsize(file_path)
+        if file_size == 0:
+            return False, "Image file is empty"
+        
+        # Try to get image info using FFprobe
+        cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', file_path]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        
+        if result.returncode != 0:
+            return False, "Invalid or corrupted image file"
+        
+        return True, "Image file is valid"
+        
+    except Exception as e:
+        return False, f"Image validation error: {str(e)}"
+
+
 
 
 app = Flask(__name__)
@@ -65,6 +452,7 @@ app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)  # Set session life
 app.config['SESSION_COOKIE_SECURE'] = False  # Set to True in production with HTTPS
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['MAX_CONTENT_LENGTH'] = 1000 * 1024 * 1024  # 1GB max file size
 
 # Create upload and output folders if they don't exist
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -72,6 +460,14 @@ os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 
 # Initialize SQLAlchemy
 db = SQLAlchemy(app)
+
+# Initialize ML models
+try:
+    ml_model = SentenceTransformer('all-MiniLM-L6-v2')
+    print("ML model loaded successfully")
+except Exception as e:
+    print(f"Warning: Could not load ML model: {e}")
+    ml_model = None
 
 # Initialize Flask-Login
 login_manager = LoginManager()
@@ -119,51 +515,47 @@ def after_request(response):
 with app.app_context():
     db.create_all()
 
-# Setup ImageMagick
-def setup_imagemagick():
-    """Setup ImageMagick configuration with detailed error reporting."""
-    print("Setting up ImageMagick configuration...")
-    
-    # First try the explicit path
-    if os.path.exists(IMAGEMAGICK_PATH):
-        print(f"Found ImageMagick at explicit path: {IMAGEMAGICK_PATH}")
-        mp_config.change_settings({"IMAGEMAGICK_BINARY": IMAGEMAGICK_PATH})
-        return True
-    
-    # Try to find ImageMagick in PATH
+# FFmpeg utility functions
+def check_ffmpeg():
+    """Check if FFmpeg is available."""
     try:
-        result = subprocess.run(['where', 'magick'], capture_output=True, text=True)
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
         if result.returncode == 0:
-            magick_path = result.stdout.strip().split('\n')[0]
-            print(f"Found ImageMagick in PATH: {magick_path}")
-            mp_config.change_settings({"IMAGEMAGICK_BINARY": magick_path})
+            print("FFmpeg is available")
             return True
-    except Exception as e:
-        print(f"Error checking PATH for ImageMagick: {str(e)}")
-    
-    # Common installation paths
-    common_paths = [
-        r"C:\Program Files\ImageMagick-7.1.1-Q16-HDRI\magick.exe",
-        r"C:\Program Files\ImageMagick-7.1.0-Q16-HDRI\magick.exe",
-        r"C:\Program Files\ImageMagick-7.0.11-Q16-HDRI\magick.exe",
-        r"C:\Program Files (x86)\ImageMagick-7.1.1-Q16-HDRI\magick.exe",
-        r"C:\Program Files (x86)\ImageMagick-7.1.0-Q16-HDRI\magick.exe",
-        r"C:\Program Files (x86)\ImageMagick-7.0.11-Q16-HDRI\magick.exe",
-        r"C:\Program Files\ImageMagick\magick.exe",
-        r"C:\Program Files (x86)\ImageMagick\magick.exe"
-    ]
-    
-    for path in common_paths:
-        if os.path.exists(path):
-            print(f"Found ImageMagick at: {path}")
-            mp_config.change_settings({"IMAGEMAGICK_BINARY": path})
-            return True
-    
-    print("WARNING: ImageMagick not found in common locations or PATH")
+    except FileNotFoundError:
+        print("WARNING: FFmpeg not found. Please install FFmpeg.")
+        return False
     return False
 
-# Setup ImageMagick at startup
-imagemagick_configured = setup_imagemagick()
+def get_video_info(input_path):
+    """Get video information using FFprobe."""
+    try:
+        cmd = [
+            'ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', input_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+    except Exception as e:
+        print(f"Error getting video info: {str(e)}")
+    return None
+
+def run_ffmpeg_command(cmd, timeout=300):
+    """Run FFmpeg command with error handling."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            print(f"FFmpeg error: {result.stderr}")
+            return False, f"FFmpeg error: {result.stderr}"
+        return True, "Success"
+    except subprocess.TimeoutExpired:
+        return False, "Processing timeout"
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+# Check FFmpeg at startup
+ffmpeg_available = check_ffmpeg()
 
 # Initialize ML models
 ml_model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -191,6 +583,75 @@ def get_output_path(filename):
 @app.route('/test')
 def test():
     return "Flask is working!"
+
+@app.route('/test-ffmpeg')
+@login_required
+def test_ffmpeg():
+    """Test FFmpeg functionality"""
+    try:
+        # Test basic FFmpeg command
+        test_cmd = ['ffmpeg', '-version']
+        result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=10)
+        
+        if result.returncode == 0:
+            return jsonify({
+                'success': True,
+                'ffmpeg_available': True,
+                'version_info': result.stdout.split('\n')[0],
+                'message': 'FFmpeg is working correctly'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'ffmpeg_available': False,
+                'error': result.stderr
+            })
+            
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'ffmpeg_available': False,
+            'error': str(e)
+        })
+
+@app.route('/test-upload', methods=['POST'])
+@login_required
+def test_upload():
+    """Test file upload functionality"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'No file uploaded'})
+        
+        file = request.files['file']
+        if not file or not file.filename:
+            return jsonify({'success': False, 'error': 'No file selected'})
+        
+        # Test file save
+        filename = secure_filename(file.filename)
+        timestamp = int(time.time())
+        test_path = os.path.join(app.config['UPLOAD_FOLDER'], f"test_{timestamp}_{filename}")
+        
+        save_success, save_message = save_file_safely(file, test_path)
+        
+        result = {
+            'success': save_success,
+            'message': save_message,
+            'filename': filename,
+            'test_path': test_path
+        }
+        
+        if save_success and os.path.exists(test_path):
+            result['file_size'] = os.path.getsize(test_path)
+            # Clean up test file
+            os.remove(test_path)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f'Test upload error: {str(e)}'
+        })
 
 @app.route('/')
 def index():
@@ -260,6 +721,67 @@ def register():
         
     return render_template('register.html')
 
+@app.route('/prompt-help', methods=['GET'])
+@login_required
+def prompt_help():
+    """Display help information for text prompts"""
+    
+    supported_commands = {
+        'Basic Operations': [
+            'trim start=10 end=30 - Trim video from 10 seconds to 30 seconds',
+            'resize width=1920 height=1080 - Resize video to 1920x1080',
+            'speed factor=2.0 - Change video speed (2.0 = 2x faster, 0.5 = 2x slower)',
+            'extract_audio format=mp3 - Extract audio as MP3 or WAV'
+        ],
+        'Color & Effects': [
+            'color_grade preset=cinematic - Apply color grading preset (cinematic, vintage, warm, cool, noir, vibrant)',
+            'color_grade brightness=0.1 contrast=1.2 saturation=0.9 - Custom color grading',
+            'effect type=blur strength=2.0 - Apply effects (blur, glow, vignette, sepia, negative, mirror, pixelate, edge_detection)',
+            'speed_ramp start=5 end=10 factor=3.0 - Apply speed ramping between timestamps'
+        ],
+        'Animation & Text': [
+            'animation type=zoom start=0 end=5 scale=1.5 - Apply animations (zoom, pan, fade, rotate)',
+            'animation type=pan direction=right start=0 end=5 - Pan animation with direction',
+            'overlay type=text content="Hello World" position=bottom-center duration=5 - Add text overlay',
+            'overlay type=text content="Sample" x=100 y=50 fontsize=32 fontcolor=yellow - Custom text overlay'
+        ],
+        'Image & Video Overlays': [
+            'overlay type=image position=top-right opacity=0.8 duration=10 - Add image overlay (requires auxiliary image file)',
+            'overlay type=image x=50 y=100 width=200 height=150 - Custom positioned image overlay',
+            'overlay type=image position=center start=5 duration=8 opacity=0.7 - Timed image overlay with transparency',
+            'overlay type=video position=bottom-left width=300 duration=15 - Add video overlay (requires auxiliary video file)',
+            'Note: Image/video overlays require uploading the overlay file in "Auxiliary Video Files" section'
+        ],
+        'Multi-Video Operations': [
+            'merge_videos transition=fade|dissolve|cut duration=X - Merge multiple videos (requires multiple file upload)',
+            'transition type=fade|dissolve|wipe|cut duration=X - Apply transitions between videos (requires multiple file upload)',
+            'Note: For merge and transition commands, use Multi Video Editor or upload multiple files'
+        ]
+    }
+    
+    return jsonify({
+        'success': True,
+        'supported_commands': supported_commands,
+        'usage_tips': [
+            'Commands are case-insensitive',
+            'Parameters can be in any order',
+            'Use quotes for text content: content="My Text"',
+            'Numeric values support decimals: factor=1.5',
+            'Time values are in seconds',
+            'For multi-video operations, use the dedicated Multi Video Editor'
+        ],
+        'examples': [
+            'trim start=5 end=15',
+            'resize width=1280 height=720',
+            'speed factor=1.5',
+            'color_grade preset=cinematic',
+            'effect type=blur strength=3',
+            'overlay type=text content="My Video" position=bottom duration=8',
+            'overlay type=image position=top-right opacity=0.8 duration=10',
+            'overlay type=image x=100 y=50 width=300 height=200 start=2 duration=5'
+        ]
+    })
+
 @app.route('/logout')
 @login_required
 def logout():
@@ -300,43 +822,42 @@ def trim_video():
         
         # Save the uploaded file
         filename = secure_filename(file.filename)
-        input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        timestamp = int(time.time())
+        input_filename = f"{timestamp}_{filename}"
+        input_path = os.path.join(app.config['UPLOAD_FOLDER'], input_filename)
         file.save(input_path)
         
-        # Load the video
-        video = mp.VideoFileClip(input_path)
-        
-        # Trim the video
-        trimmed_video = video.subclip(start_time, end_time)
-        
         # Generate output filename
-        output_filename = f'trimmed_{int(time.time())}.mp4'
+        output_filename = f'trimmed_{timestamp}.mp4'
         output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
         
-        # Write the trimmed video
-        trimmed_video.write_videofile(
-            output_path,
-            codec='libx264',
-            audio_codec='aac',
-            bitrate='8000k',
-            fps=30,
-            preset='slow',
-            threads=4,
-            ffmpeg_params=[
-                '-crf', '18',
-                '-profile:v', 'high',
-                '-level', '4.0',
-                '-movflags', '+faststart',
-                '-pix_fmt', 'yuv420p'
-            ]
-        )
+        # Calculate duration
+        duration = end_time - start_time
         
-        # Close the video
-        video.close()
-        trimmed_video.close()
+        # FFmpeg command for trimming
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-ss', str(start_time),
+            '-t', str(duration),
+            '-c:v', 'libx264',
+            '-c:a', 'aac',
+            '-crf', '18',
+            '-preset', 'fast',
+            '-movflags', '+faststart',
+            '-pix_fmt', 'yuv420p',
+            '-y',
+            output_path
+        ]
+        
+        # Run FFmpeg command
+        success, message = run_ffmpeg_command(cmd)
         
         # Clean up input file
-        os.remove(input_path)
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        
+        if not success:
+            return jsonify({'success': False, 'error': message})
         
         return jsonify({
             'success': True,
@@ -345,41 +866,12 @@ def trim_video():
         
     except Exception as e:
         print(f"Error in trim_video: {str(e)}")
+        # Clean up files on error
+        if 'input_path' in locals() and os.path.exists(input_path):
+            os.remove(input_path)
         return jsonify({'success': False, 'error': str(e)})
 
-def cleanup_files(file_paths, max_retries=5, initial_delay=2):
-    """Clean up files with retries and exponential backoff."""
-    for path in file_paths:
-        if os.path.exists(path):
-            delay = initial_delay
-            for attempt in range(max_retries):
-                try:
-                    # Force garbage collection before each attempt
-                    gc.collect()
-                    time.sleep(delay) # Add a delay before attempting deletion
-                    os.remove(path)
-                    print(f"Successfully deleted file: {path}")
-                    break
-                except Exception as e:
-                    print(f"Attempt {attempt + 1} failed to delete {path}: {str(e)}")
-                    if attempt < max_retries - 1:
-                        delay *= 2  # Exponential backoff
-                        print(f"Waiting {delay} seconds before next attempt...")
-                    else:
-                        print(f"Warning: Could not delete file {path} after {max_retries} attempts")
-
-def cleanup_videos(video_objects, delay=2):
-    """Clean up video objects safely with delay."""
-    for video in video_objects:
-        try:
-            if video is not None:
-                video.close()
-                time.sleep(delay)  # Wait after closing each video
-        except Exception as e:
-            print(f"Warning: Error closing video object: {str(e)}")
-
-def resize_with_lanczos(clip, size):
-    return clip.fl_image(lambda frame: cv2.resize(frame, size, interpolation=cv2.INTER_LANCZOS4))
+# Cleanup functions removed - no longer needed with FFmpeg
 
 @app.route('/merge', methods=['POST'])
 @login_required
@@ -391,182 +883,282 @@ def merge_videos():
             'redirect': url_for('login')
         }), 401
 
-    videos = []
     input_paths = []
-    resized_videos = []
-    final_video = None
-
+    
     try:
         if 'files[]' not in request.files:
             return jsonify({'success': False, 'error': 'No files uploaded'})
-
+        
         files = request.files.getlist('files[]')
-        if not files:
-            return jsonify({'success': False, 'error': 'No files selected'})
-
+        if len(files) < 2:
+            return jsonify({'success': False, 'error': 'Please select at least 2 videos to merge'})
+        
+        timestamp = int(time.time())
+        
         # Save uploaded files
-        for file in files:
-            if file:
+        for i, file in enumerate(files):
+            if file and file.filename:
                 filename = secure_filename(file.filename)
-                input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                input_filename = f"{timestamp}_{i}_{filename}"
+                input_path = os.path.join(app.config['UPLOAD_FOLDER'], input_filename)
                 file.save(input_path)
                 input_paths.append(input_path)
-                time.sleep(1)
-
-        # Load all videos
+        
+        if len(input_paths) < 2:
+            return jsonify({'success': False, 'error': 'At least 2 valid video files are required'})
+        
+        print(f"Merging {len(input_paths)} videos using FFmpeg...")
+        
+        # Generate output filename
+        output_filename = f'merged_{timestamp}.mp4'
+        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+        
+        # Create concat file for FFmpeg
+        concat_file = os.path.join(app.config['UPLOAD_FOLDER'], f'concat_{timestamp}.txt')
+        
         try:
-            for path in input_paths:
-                video = mp.VideoFileClip(path)
-                videos.append(video)
-                time.sleep(1)
-        except Exception as e:
-            cleanup_videos(videos)
-            cleanup_files(input_paths)
-            return jsonify({'success': False, 'error': f'Error loading videos: {str(e)}'})
-
-        try:
-            # Get the highest resolution
-            target_width = max(v.w for v in videos)
-            target_height = max(v.h for v in videos)
-            target_width = target_width - (target_width % 2)
-            target_height = target_height - (target_height % 2)
-            target_size = (target_width, target_height)
-
-            # Resize videos to match the highest resolution using Lanczos
-            for video in videos:
-                if video.w != target_width or video.h != target_height:
-                    resized_video = resize_with_lanczos(video, target_size)
-                    resized_videos.append(resized_video)
+            with open(concat_file, 'w', encoding='utf-8') as f:
+                for i, path in enumerate(input_paths):
+                    # Normalize path for FFmpeg (use forward slashes)
+                    normalized_path = path.replace('\\', '/')
+                    f.write(f"file '{normalized_path}'\n")
+                    print(f"Added to concat list {i+1}: {normalized_path}")
+            
+            # Debug: Print concat file contents
+            print(f"Concat file contents:")
+            with open(concat_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+                print(content)
+            
+            # Debug: Check if input files exist
+            for i, path in enumerate(input_paths):
+                if os.path.exists(path):
+                    size = os.path.getsize(path)
+                    print(f"Input file {i+1}: {path} (size: {size} bytes)")
                 else:
-                    resized_videos.append(video)
-                time.sleep(1)
+                    print(f"Input file {i+1}: {path} (NOT FOUND)")
+            
+            # Use filter_complex method for reliable merging (ensures all videos are included)
+            print("Using filter_complex method for reliable video merging...")
+            
+            # Build filter_complex command with individual inputs
+            filter_inputs = []
+            for i, path in enumerate(input_paths):
+                filter_inputs.extend(['-i', path])
+            
+            # Create filter complex for normalization and concatenation
+            video_filters = []
+            audio_filters = []
+            
+            for i in range(len(input_paths)):
+                # Normalize each video stream with consistent timebase
+                video_filters.append(f'[{i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,settb=AVTB[v{i}]')
+                # Normalize each audio stream
+                audio_filters.append(f'[{i}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}]')
+            
+            # Concatenate all normalized streams
+            video_inputs = ''.join([f'[v{i}]' for i in range(len(input_paths))])
+            audio_inputs = ''.join([f'[a{i}]' for i in range(len(input_paths))])
+            
+            filter_complex = ';'.join(video_filters + audio_filters + [
+                f'{video_inputs}concat=n={len(input_paths)}:v=1:a=0[outv]',
+                f'{audio_inputs}concat=n={len(input_paths)}:v=0:a=1[outa]'
+            ])
+            
+            complex_cmd = [
+                'ffmpeg'
+            ] + filter_inputs + [
+                '-filter_complex', filter_complex,
+                '-map', '[outv]',
+                '-map', '[outa]',
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-crf', '23',
+                '-preset', 'medium',
+                '-movflags', '+faststart',
+                '-pix_fmt', 'yuv420p',
+                '-y', output_path
+            ]
+            
+            success, message = run_ffmpeg_command(complex_cmd, timeout=900)
+            
+            if not success:
+                print(f"Filter complex failed: {message}")
+                print("Trying two-step normalization approach...")
+                
+                # Two-step approach: First normalize each video, then concatenate
+                normalized_paths = []
+                
+                for i, input_path in enumerate(input_paths):
+                    norm_filename = f"norm_{timestamp}_{i}.mp4"
+                    norm_path = os.path.join(app.config['UPLOAD_FOLDER'], norm_filename)
+                    
+                    # Normalize individual video
+                    norm_cmd = [
+                        'ffmpeg', '-i', input_path,
+                        '-c:v', 'libx264',
+                        '-c:a', 'aac',
+                        '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
+                        '-r', '30',
+                        '-ar', '44100',
+                        '-ac', '2',
+                        '-crf', '23',
+                        '-preset', 'medium',
+                        '-pix_fmt', 'yuv420p',
+                        '-y', norm_path
+                    ]
+                    
+                    norm_success, norm_message = run_ffmpeg_command(norm_cmd, timeout=300)
+                    if not norm_success:
+                        # Clean up and return error
+                        for path in normalized_paths:
+                            if os.path.exists(path):
+                                os.remove(path)
+                        return jsonify({'success': False, 'error': f'Failed to normalize video {i+1}: {norm_message}'})
+                    
+                    normalized_paths.append(norm_path)
+                
+                # Update concat file with normalized videos
+                with open(concat_file, 'w', encoding='utf-8') as f:
+                    for path in normalized_paths:
+                        normalized_path = path.replace('\\', '/')
+                        f.write(f"file '{normalized_path}'\n")
+                
+                # Concatenate normalized videos
+                final_concat_cmd = [
+                    'ffmpeg', '-f', 'concat', '-safe', '0', '-i', concat_file,
+                    '-c', 'copy',
+                    '-y', output_path
+                ]
+                
+                success, message = run_ffmpeg_command(final_concat_cmd, timeout=300)
+                
+                # Clean up normalized files
+                for path in normalized_paths:
+                    if os.path.exists(path):
+                        os.remove(path)
+        
+        except Exception as e:
+            success = False
+            message = f"File operation error: {str(e)}"
+        
+        # Clean up
+        for path in input_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        if os.path.exists(concat_file):
+            os.remove(concat_file)
+        
+        if not success:
+            return jsonify({'success': False, 'error': f'FFmpeg merge failed: {message}'})
+        
+        return jsonify({
+            'success': True,
+            'output_file': output_filename,
+            'message': f'Successfully merged {len(input_paths)} videos using FFmpeg'
+        })
+            
+    except Exception as e:
+        print(f"Error in merge_videos: {str(e)}")
+        # Clean up files on error
+        for path in input_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        concat_file_path = os.path.join(app.config['UPLOAD_FOLDER'], f'concat_{timestamp}.txt')
+        if os.path.exists(concat_file_path):
+            os.remove(concat_file_path)
+        return jsonify({'success': False, 'error': f'Merge error: {str(e)}'})
 
+@app.route('/merge-simple', methods=['POST'])
+@login_required
+def merge_videos_simple():
+    """Simple video merge using MoviePy (fallback method)"""
+    input_paths = []
+    
+    try:
+        if 'files[]' not in request.files:
+            return jsonify({'success': False, 'error': 'No files uploaded'})
+        
+        files = request.files.getlist('files[]')
+        if len(files) < 2:
+            return jsonify({'success': False, 'error': 'Please select at least 2 videos to merge'})
+        
+        timestamp = int(time.time())
+        
+        # Save uploaded files
+        for i, file in enumerate(files):
+            if file and file.filename:
+                filename = secure_filename(file.filename)
+                input_filename = f"{timestamp}_{i}_{filename}"
+                input_path = os.path.join(app.config['UPLOAD_FOLDER'], input_filename)
+                file.save(input_path)
+                input_paths.append(input_path)
+        
+        # Load video clips
+        video_clips = []
+        try:
+            for input_path in input_paths:
+                clip = mp.VideoFileClip(input_path)
+                video_clips.append(clip)
+            
             # Concatenate videos
-            final_video = mp.concatenate_videoclips(resized_videos)
-
+            final_video = mp.concatenate_videoclips(video_clips, method="compose")
+            
             # Generate output filename
-            output_filename = f'merged_{int(time.time())}.mp4'
+            output_filename = f'merged_simple_{timestamp}.mp4'
             output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
-
-            # Write the final video
+            
+            # Write the merged video
             final_video.write_videofile(
                 output_path,
                 codec='libx264',
                 audio_codec='aac',
-                bitrate='12000k',  # Higher bitrate for better quality
+                bitrate='8000k',
                 fps=30,
-                preset='slow',
+                preset='medium',
                 threads=4,
                 ffmpeg_params=[
-                    '-crf', '16',  # Lower CRF for higher quality
+                    '-crf', '20',
                     '-profile:v', 'high',
                     '-level', '4.0',
                     '-movflags', '+faststart',
                     '-pix_fmt', 'yuv420p'
                 ]
             )
-
-            time.sleep(3)
-            cleanup_videos(videos)
-            cleanup_videos(resized_videos)
-            if final_video:
-                cleanup_videos([final_video])
-            gc.collect()
-            time.sleep(2)
-            cleanup_files(input_paths)
-
+            
+            # Close clips
+            for clip in video_clips:
+                clip.close()
+            final_video.close()
+            
+            # Clean up input files
+            for path in input_paths:
+                if os.path.exists(path):
+                    os.remove(path)
+            
             return jsonify({
                 'success': True,
-                'output_file': output_filename
+                'output_file': output_filename,
+                'method': 'MoviePy simple merge'
             })
-
+            
         except Exception as e:
-            cleanup_videos(videos)
-            cleanup_videos(resized_videos)
-            if final_video:
-                cleanup_videos([final_video])
-            cleanup_files(input_paths)
-            return jsonify({'success': False, 'error': f'Error processing videos: {str(e)}'})
-
+            # Close any opened clips
+            for clip in video_clips:
+                try:
+                    clip.close()
+                except:
+                    pass
+            raise e
+            
     except Exception as e:
-        cleanup_videos(videos)
-        cleanup_videos(resized_videos)
-        if final_video:
-            cleanup_videos([final_video])
-        cleanup_files(input_paths)
-        return jsonify({'success': False, 'error': f'Unexpected error: {str(e)}'})@app.route('/extract-audio', methods=['POST'])
-@app.route('/add-overlay', methods=['POST'])
-@login_required
-def add_overlay():
-    try:
-        if 'file' not in request.files or 'overlay' not in request.files:
-            return jsonify({'success': False, 'error': 'Both main and overlay files are required.'})
+        print(f"Error in merge_videos_simple: {str(e)}")
+        # Clean up files on error
+        for path in input_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        return jsonify({'success': False, 'error': f'Simple merge failed: {str(e)}'})
 
-        main_file = request.files['file']
-        overlay_file = request.files['overlay']
-        x_pos = int(request.form.get('x_pos', 0))
-        y_pos = int(request.form.get('y_pos', 0))
-
-        # Save files
-        main_filename = secure_filename(main_file.filename)
-        overlay_filename = secure_filename(overlay_file.filename)
-        main_path = os.path.join(app.config['UPLOAD_FOLDER'], main_filename)
-        overlay_path = os.path.join(app.config['UPLOAD_FOLDER'], overlay_filename)
-        main_file.save(main_path)
-        overlay_file.save(overlay_path)
-
-        # Load main video
-        main_clip = mp.VideoFileClip(main_path)
-
-        # Try loading overlay as video, fallback to image
-        try:
-            overlay_clip = mp.VideoFileClip(overlay_path)
-            # Use the minimum duration to avoid out-of-bounds errors
-            overlay_duration = min(main_clip.duration, overlay_clip.duration)
-            overlay_clip = overlay_clip.set_start(0).set_duration(overlay_duration)
-            main_subclip = main_clip.subclip(0, overlay_duration)
-        except Exception:
-            overlay_clip = mp.ImageClip(overlay_path).set_duration(main_clip.duration)
-            main_subclip = main_clip
-
-        # Set overlay position
-        overlay_clip = overlay_clip.set_position((x_pos, y_pos))
-
-        # Composite the clips
-        final = mp.CompositeVideoClip([main_subclip, overlay_clip])
-
-        # Output
-        output_filename = f'overlay_{int(time.time())}.mp4'
-        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
-        final.write_videofile(
-            output_path,
-            codec='libx264',
-            audio_codec='aac',
-            bitrate='8000k',
-            fps=main_clip.fps,
-            preset='slow',
-            threads=4,
-            ffmpeg_params=[
-                '-crf', '18',
-                '-profile:v', 'high',
-                '-level', '4.0',
-                '-movflags', '+faststart',
-                '-pix_fmt', 'yuv420p'
-            ]
-        )
-
-        # Cleanup
-        main_clip.close()
-        overlay_clip.close()
-        final.close()
-        os.remove(main_path)
-        os.remove(overlay_path)
-
-        return jsonify({'success': True, 'output_file': output_filename})
-
-    except Exception as e:
-        print(f"Error in add_overlay: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)})
 @app.route('/extract-audio', methods=['POST'])
 @login_required
 def extract_audio():
@@ -580,28 +1172,35 @@ def extract_audio():
         
         # Save the uploaded file
         filename = secure_filename(file.filename)
-        input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        timestamp = int(time.time())
+        input_filename = f"{timestamp}_{filename}"
+        input_path = os.path.join(app.config['UPLOAD_FOLDER'], input_filename)
         file.save(input_path)
         
-        # Load the video
-        video = mp.VideoFileClip(input_path)
-        
-        # Extract audio
-        audio = video.audio
-        
         # Generate output filename
-        output_filename = f'audio_{int(time.time())}.mp3'
+        output_filename = f'audio_{timestamp}.mp3'
         output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
         
-        # Write the audio
-        audio.write_audiofile(output_path)
+        # FFmpeg command for audio extraction
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vn',  # No video
+            '-acodec', 'mp3',
+            '-ab', '192k',  # Audio bitrate
+            '-ar', '44100',  # Sample rate
+            '-y',
+            output_path
+        ]
         
-        # Close the video and audio
-        video.close()
-        audio.close()
+        # Run FFmpeg command
+        success, message = run_ffmpeg_command(cmd)
         
         # Clean up input file
-        os.remove(input_path)
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        
+        if not success:
+            return jsonify({'success': False, 'error': message})
         
         return jsonify({
             'success': True,
@@ -610,6 +1209,9 @@ def extract_audio():
         
     except Exception as e:
         print(f"Error in extract_audio: {str(e)}")
+        # Clean up files on error
+        if 'input_path' in locals() and os.path.exists(input_path):
+            os.remove(input_path)
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/change-speed', methods=['POST'])
@@ -627,43 +1229,58 @@ def change_speed():
             
         # Save the uploaded file
         filename = secure_filename(file.filename)
-        input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        timestamp = int(time.time())
+        input_filename = f"{timestamp}_{filename}"
+        input_path = os.path.join(app.config['UPLOAD_FOLDER'], input_filename)
         file.save(input_path)
         
-        # Load the video
-        video = mp.VideoFileClip(input_path)
-        
-        # Change speed
-        speeded_video = video.speedx(speed_factor)
-        
         # Generate output filename
-        output_filename = f'speed_{int(time.time())}.mp4'
+        output_filename = f'speed_{timestamp}.mp4'
         output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
         
-        # Write the speeded video
-        speeded_video.write_videofile(
-            output_path,
-            codec='libx264',
-            audio_codec='aac',
-            bitrate='8000k',
-            fps=30,
-            preset='slow',
-            threads=4,
-            ffmpeg_params=[
-                '-crf', '18',
-                '-profile:v', 'high',
-                '-level', '4.0',
-                '-movflags', '+faststart',
-                '-pix_fmt', 'yuv420p'
-            ]
-        )
+        # FFmpeg command for speed change
+        # For video speed: use setpts filter
+        # For audio speed: use atempo filter
+        video_speed = f"setpts={1/speed_factor}*PTS"
+        audio_speed = f"atempo={speed_factor}"
         
-        # Close the video
-        video.close()
-        speeded_video.close()
+        # Handle extreme speed factors for audio (atempo has limits)
+        audio_filters = []
+        remaining_factor = speed_factor
+        while remaining_factor > 2.0:
+            audio_filters.append("atempo=2.0")
+            remaining_factor /= 2.0
+        while remaining_factor < 0.5:
+            audio_filters.append("atempo=0.5")
+            remaining_factor /= 0.5
+        if remaining_factor != 1.0:
+            audio_filters.append(f"atempo={remaining_factor}")
+        
+        audio_filter_str = ",".join(audio_filters) if audio_filters else "anull"
+        
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-filter_complex', f'[0:v]{video_speed}[v];[0:a]{audio_filter_str}[a]',
+            '-map', '[v]', '-map', '[a]',
+            '-c:v', 'libx264',
+            '-c:a', 'aac',
+            '-crf', '18',
+            '-preset', 'fast',
+            '-movflags', '+faststart',
+            '-pix_fmt', 'yuv420p',
+            '-y',
+            output_path
+        ]
+        
+        # Run FFmpeg command
+        success, message = run_ffmpeg_command(cmd)
         
         # Clean up input file
-        os.remove(input_path)
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        
+        if not success:
+            return jsonify({'success': False, 'error': message})
         
         return jsonify({
             'success': True,
@@ -672,6 +1289,9 @@ def change_speed():
         
     except Exception as e:
         print(f"Error in change_speed: {str(e)}")
+        # Clean up files on error
+        if 'input_path' in locals() and os.path.exists(input_path):
+            os.remove(input_path)
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/resize', methods=['POST'])
@@ -687,140 +1307,292 @@ def resize_video():
         
         if not file:
             return jsonify({'success': False, 'error': 'No file selected'})
+            
         if width <= 0 or height <= 0:
             return jsonify({'success': False, 'error': 'Invalid dimensions'})
         
+        # Ensure dimensions are even (required for H.264)
+        width = width - (width % 2)
+        height = height - (height % 2)
+        
+        # Save the uploaded file
         filename = secure_filename(file.filename)
-        input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        timestamp = int(time.time())
+        input_filename = f"{timestamp}_{filename}"
+        input_path = os.path.join(app.config['UPLOAD_FOLDER'], input_filename)
         file.save(input_path)
         
-        video = mp.VideoFileClip(input_path)
-        resized_video = video.resize((width, height)) # <-- THIS IS CORRECT
-        
-        output_filename = f'resized_{int(time.time())}.mp4'
+        # Generate output filename
+        output_filename = f'resized_{timestamp}.mp4'
         output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
         
-        resized_video.write_videofile(
-            output_path,
-            codec='libx264',
-            audio_codec='aac',
-            bitrate='8000k',
-            fps=30,
-            preset='slow',
-            threads=4,
-            ffmpeg_params=[
-                '-crf', '18',
-                '-profile:v', 'high',
-                '-level', '4.0',
-                 '-movflags', '+faststart',
-                '-pix_fmt', 'yuv420p'
-            ]
-        )
+        # FFmpeg command for resizing
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vf', f'scale={width}:{height}',
+            '-c:v', 'libx264',
+            '-c:a', 'aac',
+            '-crf', '18',
+            '-preset', 'fast',
+            '-movflags', '+faststart',
+            '-pix_fmt', 'yuv420p',
+            '-y',
+            output_path
+        ]
         
-        video.close()
-        resized_video.close()
-        os.remove(input_path)
+        # Run FFmpeg command
+        success, message = run_ffmpeg_command(cmd)
         
-        return jsonify({'success': True, 'output_file': output_filename})
+        # Clean up input file
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        
+        if not success:
+            return jsonify({'success': False, 'error': message})
+        
+        return jsonify({
+            'success': True,
+            'output_file': output_filename
+        })
+        
     except Exception as e:
         print(f"Error in resize_video: {str(e)}")
+        # Clean up files on error
+        if 'input_path' in locals() and os.path.exists(input_path):
+            os.remove(input_path)
         return jsonify({'success': False, 'error': str(e)})
-
-import numpy as np
-from moviepy.editor import VideoFileClip, concatenate_videoclips, CompositeVideoClip
-
-def make_wipe_mask(size, duration):
-    w, h = size
-    def mask(get_frame, t):
-        prog = np.clip(t / duration, 0, 1)
-        mask_frame = np.zeros((h, w), dtype=float)
-        mask_frame[:, :int(w * prog)] = 1.0
-        return mask_frame
-    return mask
 
 @app.route('/apply-transition', methods=['POST'])
 @login_required
 def apply_transition():
+    input_paths = []
+    processed_paths = []
+    
     try:
-        if 'files[]' not in request.files:
+        # Check for multiple files (transition between videos)
+        if 'files[]' in request.files:
+            files = request.files.getlist('files[]')
+            if len(files) < 2:
+                return jsonify({'success': False, 'error': 'Please select at least 2 videos for transitions'})
+        else:
             return jsonify({'success': False, 'error': 'No files uploaded'})
         
-        files = request.files.getlist('files[]')
         transition_type = request.form.get('transition_type', 'fade')
         duration = float(request.form.get('duration', 1.0))
         
-        if len(files) < 2:
-            return jsonify({'success': False, 'error': 'Please upload at least two videos for transition.'})
+        timestamp = int(time.time())
         
         # Save uploaded files
-        input_paths = []
-        for file in files:
-            filename = secure_filename(file.filename)
-            input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(input_path)
-            input_paths.append(input_path)
+        for i, file in enumerate(files):
+            if file and file.filename:
+                filename = secure_filename(file.filename)
+                input_filename = f"{timestamp}_{i}_{filename}"
+                input_path = os.path.join(app.config['UPLOAD_FOLDER'], input_filename)
+                file.save(input_path)
+                input_paths.append(input_path)
         
-        # Load all videos
-        clips = [mp.VideoFileClip(path) for path in input_paths]
+        if len(input_paths) < 2:
+            return jsonify({'success': False, 'error': 'At least 2 valid video files are required for transitions'})
         
-        # Resize all clips to the same size (use the largest dimensions)
-        max_w = max(clip.w for clip in clips)
-        max_h = max(clip.h for clip in clips)
-        target_size = (max_w, max_h)
-        clips = [clip.resize(newsize=target_size) if (clip.w, clip.h) != target_size else clip for clip in clips]
+        print(f"Applying {transition_type} transitions between {len(input_paths)} videos using FFmpeg...")
         
-        # Apply transition
-        if transition_type in ['dissolve', 'fade']:
-            for i in range(1, len(clips)):
-                clips[i] = clips[i].crossfadein(duration)
-            final = mp.concatenate_videoclips(clips, method="compose", padding=-duration)
-        elif transition_type == 'wipe':
-            # Only supports two clips for simplicity
-            if len(clips) != 2:
-                for clip in clips:
-                    clip.close()
-                for path in input_paths:
-                    os.remove(path)
-                return jsonify({'success': False, 'error': 'Wipe transition currently supports only two videos.'})
-            clip1, clip2 = clips
-            mask = mp.VideoClip(make_wipe_mask((max_w, max_h), duration), duration=duration)
-            clip2_masked = clip2.set_start(clip1.duration - duration).set_mask(mask)
-            final = CompositeVideoClip([clip1, clip2_masked]).set_duration(clip1.duration + clip2.duration - duration)
-        else:
-            final = mp.concatenate_videoclips(clips, method="compose")
-        
-        # Output
-        output_filename = f'transition_{int(time.time())}.mp4'
+        # Generate output filename
+        output_filename = f'transition_{transition_type}_{timestamp}.mp4'
         output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
-        final.write_videofile(
-            output_path,
-            codec='libx264',
-            audio_codec='aac',
-            bitrate='8000k',
-            fps=30,
-            preset='slow',
-            threads=4,
-            ffmpeg_params=[
-                '-crf', '18',
-                '-profile:v', 'high',
-                '-level', '4.0',
-                '-movflags', '+faststart',
-                '-pix_fmt', 'yuv420p'
+        
+        # First normalize all videos to same format to avoid timebase issues
+        normalized_paths = []
+        
+        print(f"Normalizing {len(input_paths)} videos to consistent format...")
+        for i, input_path in enumerate(input_paths):
+            norm_filename = f"norm_{timestamp}_{i}.mp4"
+            norm_path = os.path.join(app.config['UPLOAD_FOLDER'], norm_filename)
+            
+            # Normalize video to consistent format
+            norm_cmd = [
+                'ffmpeg', '-i', input_path,
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
+                '-r', '30',  # Force consistent frame rate
+                '-ar', '44100',  # Force consistent audio sample rate
+                '-ac', '2',  # Force stereo
+                '-crf', '23',
+                '-preset', 'medium',
+                '-pix_fmt', 'yuv420p',
+                '-y', norm_path
             ]
-        )
+            
+            success, message = run_ffmpeg_command(norm_cmd, timeout=300)
+            if not success:
+                # Clean up and return error
+                for path in normalized_paths:
+                    if os.path.exists(path):
+                        os.remove(path)
+                return jsonify({'success': False, 'error': f'Failed to normalize video {i+1}: {message}'})
+            
+            normalized_paths.append(norm_path)
         
-        # Cleanup
-        for clip in clips:
-            clip.close()
-        final.close()
+        # Now apply transitions based on type
+        if transition_type == 'fade':
+            print("Applying fade transitions...")
+            
+            if len(normalized_paths) == 2:
+                # Simple crossfade for 2 videos
+                fade_cmd = [
+                    'ffmpeg', '-i', normalized_paths[0], '-i', normalized_paths[1],
+                    '-filter_complex',
+                    f'[0:v][1:v]xfade=transition=fade:duration={duration}:offset=5[v];'
+                    f'[0:a][1:a]acrossfade=d={duration}[a]',
+                    '-map', '[v]', '-map', '[a]',
+                    '-c:v', 'libx264', '-c:a', 'aac',
+                    '-crf', '23', '-preset', 'medium',
+                    '-movflags', '+faststart',
+                    '-pix_fmt', 'yuv420p',
+                    '-y', output_path
+                ]
+                
+                success, message = run_ffmpeg_command(fade_cmd, timeout=600)
+            else:
+                # Multiple videos - use concat with fade effects
+                fade_concat_file = os.path.join(app.config['UPLOAD_FOLDER'], f'fade_concat_{timestamp}.txt')
+                
+                with open(fade_concat_file, 'w', encoding='utf-8') as f:
+                    for path in normalized_paths:
+                        normalized_path = path.replace('\\', '/')
+                        f.write(f"file '{normalized_path}'\n")
+                
+                fade_cmd = [
+                    'ffmpeg', '-f', 'concat', '-safe', '0', '-i', fade_concat_file,
+                    '-vf', f'fade=in:0:{int(duration*30)},fade=out:st={max(0, 30-duration)}:d={duration}',
+                    '-af', f'afade=in:st=0:d={duration},afade=out:st={max(0, 30-duration)}:d={duration}',
+                    '-c:v', 'libx264', '-c:a', 'aac',
+                    '-crf', '23', '-preset', 'medium',
+                    '-movflags', '+faststart',
+                    '-pix_fmt', 'yuv420p',
+                    '-y', output_path
+                ]
+                
+                success, message = run_ffmpeg_command(fade_cmd, timeout=600)
+                
+                if os.path.exists(fade_concat_file):
+                    os.remove(fade_concat_file)
+        
+        elif transition_type == 'dissolve':
+            print("Applying dissolve transitions...")
+            
+            if len(normalized_paths) == 2:
+                # Simple crossfade between two normalized videos
+                dissolve_cmd = [
+                    'ffmpeg', '-i', normalized_paths[0], '-i', normalized_paths[1],
+                    '-filter_complex',
+                    f'[0:v][1:v]xfade=transition=dissolve:duration={duration}:offset=5[v];'
+                    f'[0:a][1:a]acrossfade=d={duration}[a]',
+                    '-map', '[v]', '-map', '[a]',
+                    '-c:v', 'libx264', '-c:a', 'aac',
+                    '-crf', '23', '-preset', 'medium',
+                    '-movflags', '+faststart',
+                    '-pix_fmt', 'yuv420p',
+                    '-y', output_path
+                ]
+                
+                success, message = run_ffmpeg_command(dissolve_cmd, timeout=600)
+            else:
+                # For multiple videos, just concatenate (dissolve works best with 2 videos)
+                dissolve_concat_file = os.path.join(app.config['UPLOAD_FOLDER'], f'dissolve_concat_{timestamp}.txt')
+                
+                with open(dissolve_concat_file, 'w', encoding='utf-8') as f:
+                    for path in normalized_paths:
+                        normalized_path = path.replace('\\', '/')
+                        f.write(f"file '{normalized_path}'\n")
+                
+                dissolve_cmd = [
+                    'ffmpeg', '-f', 'concat', '-safe', '0', '-i', dissolve_concat_file,
+                    '-c', 'copy',
+                    '-y', output_path
+                ]
+                
+                success, message = run_ffmpeg_command(dissolve_cmd, timeout=300)
+                
+                if os.path.exists(dissolve_concat_file):
+                    os.remove(dissolve_concat_file)
+        
+        elif transition_type == 'wipe':
+            print("Applying wipe transitions...")
+            
+            if len(normalized_paths) == 2:
+                # Wipe transition between two normalized videos
+                wipe_cmd = [
+                    'ffmpeg', '-i', normalized_paths[0], '-i', normalized_paths[1],
+                    '-filter_complex',
+                    f'[0:v][1:v]xfade=transition=wipeleft:duration={duration}:offset=5[v];'
+                    f'[0:a][1:a]acrossfade=d={duration}[a]',
+                    '-map', '[v]', '-map', '[a]',
+                    '-c:v', 'libx264', '-c:a', 'aac',
+                    '-crf', '23', '-preset', 'medium',
+                    '-movflags', '+faststart',
+                    '-pix_fmt', 'yuv420p',
+                    '-y', output_path
+                ]
+                
+                success, message = run_ffmpeg_command(wipe_cmd, timeout=600)
+            else:
+                success = False
+                message = "Wipe transition currently supports only 2 videos"
+        
+        elif transition_type == 'cut':
+            print("Applying cut transitions (simple concatenation)...")
+            
+            # Simple concatenation of normalized videos
+            cut_concat_file = os.path.join(app.config['UPLOAD_FOLDER'], f'cut_concat_{timestamp}.txt')
+            
+            with open(cut_concat_file, 'w', encoding='utf-8') as f:
+                for path in normalized_paths:
+                    normalized_path = path.replace('\\', '/')
+                    f.write(f"file '{normalized_path}'\n")
+            
+            cut_cmd = [
+                'ffmpeg', '-f', 'concat', '-safe', '0', '-i', cut_concat_file,
+                '-c', 'copy',
+                '-y', output_path
+            ]
+            
+            success, message = run_ffmpeg_command(cut_cmd, timeout=300)
+            
+            if os.path.exists(cut_concat_file):
+                os.remove(cut_concat_file)
+        
+        else:
+            success = False
+            message = f"Unsupported transition type: {transition_type}"
+        
+        # Clean up normalized files
+        for path in normalized_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        
+        # Clean up input files
         for path in input_paths:
-            os.remove(path)
+            if os.path.exists(path):
+                os.remove(path)
         
-        return jsonify({'success': True, 'output_file': output_filename})
+        if not success:
+            return jsonify({'success': False, 'error': f'Transition failed: {message}'})
+        
+        return jsonify({
+            'success': True,
+            'output_file': output_filename,
+            'message': f'Applied {transition_type} transitions using FFmpeg'
+        })
         
     except Exception as e:
         print(f"Error in apply_transition: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)})
+        # Clean up files on error
+        for path in input_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        return jsonify({'success': False, 'error': f'Transition error: {str(e)}'})
+
 @app.route('/apply-color-grading', methods=['POST'])
 @login_required
 def apply_color_grading():
@@ -836,55 +1608,55 @@ def apply_color_grading():
         
         # Save the uploaded file
         filename = secure_filename(file.filename)
-        input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        timestamp = int(time.time())
+        input_filename = f"{timestamp}_{filename}"
+        input_path = os.path.join(app.config['UPLOAD_FOLDER'], input_filename)
         file.save(input_path)
         
-        # Load the video
-        video = mp.VideoFileClip(input_path)
-        
-        # Apply color grading
-        if color_style == 'cinematic':
-            graded_video = video.fx(mp.vfx.colorx, 1.2)
-        elif color_style == 'vintage':
-            graded_video = video.fx(mp.vfx.colorx, 0.8)
-        elif color_style == 'warm':
-            graded_video = video.fx(mp.vfx.colorx, 1.1)
-        elif color_style == 'cool':
-            graded_video = video.fx(mp.vfx.colorx, 0.9)
-        elif color_style == 'noir':
-            graded_video = video.fx(mp.vfx.blackwhite)
-        else:
-            graded_video = video
-            
         # Generate output filename
-        output_filename = f'color_graded_{int(time.time())}.mp4'
+        output_filename = f'color_graded_{timestamp}.mp4'
         output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
         
-        # Write the graded video
-        graded_video.write_videofile(
-            output_path,
-            codec='libx264',
-            audio_codec='aac',
-            bitrate='8000k',
-            fps=30,
-            preset='slow',
-            threads=4,
-            ffmpeg_params=[
-                '-crf', '18',
-                '-profile:v', 'high',
-                '-level', '4.0',
-                '-movflags', '+faststart',
-                '-pix_fmt', 'yuv420p'
+        # Apply color grading using FFmpeg
+        if color_style == 'cinematic':
+            # Increase contrast and saturation for cinematic look
+            cmd = [
+                'ffmpeg', '-i', input_path,
+                '-vf', 'eq=contrast=1.2:saturation=1.1:brightness=0.05',
+                '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+                '-c:a', 'aac', '-movflags', '+faststart', '-y', output_path
             ]
-        )
-        
-        # Close the video
-        video.close()
-        graded_video.close()
-        
-        # Clean up input file
-        os.remove(input_path)
-        
+        elif color_style == 'vintage':
+            # Vintage look with sepia tones
+            cmd = [
+                'ffmpeg', '-i', input_path,
+                '-vf', 'colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131',
+                '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+                '-c:a', 'aac', '-movflags', '+faststart', '-y', output_path
+            ]
+        elif color_style == 'warm':
+            # Warm color temperature
+            cmd = [
+                'ffmpeg', '-i', input_path,
+                '-vf', 'eq=brightness=0.1:saturation=1.2,colortemperature=3000',
+                '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+                '-c:a', 'aac', '-movflags', '+faststart', '-y', output_path
+            ]
+        elif color_style == 'cool':
+            # Cool color temperature
+            cmd = [
+                'ffmpeg', '-i', input_path,
+                '-vf', 'eq=brightness=-0.05:saturation=0.9,colortemperature=7000',
+                '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+                '-c:a', 'aac', '-movflags', '+faststart', '-y', output_path
+            ]
+        elif color_style == 'noir':
+            # Black and white with high contrast
+            cmd = [
+                'ffmpeg', '-i', input_path,
+                '-vf', 'format=gray,eq=contrast=1.5:brightness=0.1',
+                '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+                 '-c:a', 'aac', '-movflags', '+faststart']
         return jsonify({
             'success': True,
             'output_file': output_filename
@@ -997,20 +1769,42 @@ def apply_effects():
                 freeze_clip,
                 video.subclip(video.duration / 2)
             ])
-        elif effect_type == 'motion_blur':
-            effected_video = video.fx(mp.vfx.motion_blur, 2)
-        elif effect_type == 'gaussian_blur':
-            effected_video = video.fx(mp.vfx.gaussian_blur, sigma=2)
+        elif effect_type == 'blur':
+            # Custom blur effect using OpenCV
+            def blur_frame(frame):
+                return cv2.GaussianBlur(frame, (15, 15), 0)
+            effected_video = video.fl_image(blur_frame)
         elif effect_type == 'sepia':
-            effected_video = video.fx(mp.vfx.colorx, 0.8)
+            # Custom sepia effect
+            def sepia_frame(frame):
+                sepia_filter = np.array([[0.272, 0.534, 0.131],
+                                       [0.349, 0.686, 0.168],
+                                       [0.393, 0.769, 0.189]])
+                sepia_img = frame.dot(sepia_filter.T)
+                sepia_img = np.clip(sepia_img, 0, 255)
+                return sepia_img.astype(np.uint8)
+            effected_video = video.fl_image(sepia_frame)
         elif effect_type == 'negative':
             effected_video = video.fx(mp.vfx.invert_colors)
         elif effect_type == 'mirror':
             effected_video = video.fx(mp.vfx.mirror_x)
         elif effect_type == 'pixelate':
-            effected_video = video.fx(mp.vfx.pixelate, 10)
+            # Custom pixelate effect
+            def pixelate_frame(frame):
+                h, w = frame.shape[:2]
+                # Resize down and up to create pixelation
+                small = cv2.resize(frame, (w//10, h//10), interpolation=cv2.INTER_LINEAR)
+                return cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+            effected_video = video.fl_image(pixelate_frame)
         elif effect_type == 'edge_detection':
-            effected_video = video.fx(mp.vfx.blackwhite).fx(mp.vfx.invert_colors)
+            # Custom edge detection
+            def edge_frame(frame):
+                gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                edges = cv2.Canny(gray, 100, 200)
+                return cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+            effected_video = video.fl_image(edge_frame)
+        elif effect_type == 'black_white':
+            effected_video = video.fx(mp.vfx.blackwhite)
         else:
             effected_video = video
             
@@ -1153,6 +1947,2439 @@ def apply_animation():
     except Exception as e:
         print(f"Error in apply_animation: {str(e)}")
         return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/add-overlay', methods=['POST'])
+@login_required
+def add_overlay():
+    """Add overlay (image/video/text) to main video using FFmpeg for better performance"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'Main video file is required.'})
+
+        main_file = request.files['file']
+        overlay_type = request.form.get('overlay_type', 'image')  # image, video, text
+        
+        timestamp = int(time.time())
+        
+        # Save main video file
+        main_filename = secure_filename(main_file.filename)
+        main_input_filename = f"{timestamp}_main_{main_filename}"
+        main_path = os.path.join(app.config['UPLOAD_FOLDER'], main_input_filename)
+        
+        save_success, save_message = save_file_safely(main_file, main_path)
+        if not save_success:
+            return jsonify({'success': False, 'error': f'Failed to save main video: {save_message}'})
+
+        # Validate main video
+        validate_success, validate_message = validate_and_repair_video_file(main_path, 1)
+        if not validate_success:
+            if os.path.exists(main_path):
+                os.remove(main_path)
+            return jsonify({'success': False, 'error': validate_message})
+
+        output_filename = f'overlay_{timestamp}.mp4'
+        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+
+        if overlay_type == 'text':
+            # Text overlay
+            text_content = request.form.get('text_content', 'Sample Text')
+            x_pos = request.form.get('x_pos', '10')
+            y_pos = request.form.get('y_pos', '10')
+            font_size = request.form.get('font_size', '24')
+            font_color = request.form.get('font_color', 'white')
+            duration = request.form.get('duration', '0')  # 0 means entire video
+            position = request.form.get('position', 'custom')
+            
+            # Position presets
+            if position != 'custom':
+                pos_map = {
+                    'top-left': '10:10',
+                    'top-center': '(w-text_w)/2:10',
+                    'top-right': 'w-text_w-10:10',
+                    'center-left': '10:(h-text_h)/2',
+                    'center': '(w-text_w)/2:(h-text_h)/2',
+                    'center-right': 'w-text_w-10:(h-text_h)/2',
+                    'bottom-left': '10:h-text_h-10',
+                    'bottom-center': '(w-text_w)/2:h-text_h-10',
+                    'bottom-right': 'w-text_w-10:h-text_h-10'
+                }
+                text_pos = pos_map.get(position, f'{x_pos}:{y_pos}')
+            else:
+                text_pos = f'{x_pos}:{y_pos}'
+            
+            # Build text filter
+            if duration == '0':
+                text_filter = f'drawtext=text=\'{text_content}\':fontsize={font_size}:fontcolor={font_color}:x={text_pos}'
+            else:
+                text_filter = f'drawtext=text=\'{text_content}\':fontsize={font_size}:fontcolor={font_color}:x={text_pos}:enable=\'between(t,0,{duration})\''
+            
+            cmd = [
+                'ffmpeg', '-i', main_path,
+                '-vf', text_filter,
+                '-c:v', 'libx264',
+                '-c:a', 'copy',
+                '-crf', '23',
+                '-preset', 'medium',
+                '-movflags', '+faststart',
+                '-pix_fmt', 'yuv420p',
+                '-y', output_path
+            ]
+            
+        elif overlay_type in ['image', 'video']:
+            # Image or video overlay
+            if 'overlay_file' not in request.files:
+                if os.path.exists(main_path):
+                    os.remove(main_path)
+                return jsonify({'success': False, 'error': f'{overlay_type.title()} overlay file is required.'})
+            
+            overlay_file = request.files['overlay_file']
+            x_pos = int(request.form.get('x_pos', 0))
+            y_pos = int(request.form.get('y_pos', 0))
+            scale_width = request.form.get('scale_width', '')
+            scale_height = request.form.get('scale_height', '')
+            opacity = float(request.form.get('opacity', 1.0))
+            
+            # Save overlay file
+            overlay_filename = secure_filename(overlay_file.filename)
+            overlay_input_filename = f"{timestamp}_overlay_{overlay_filename}"
+            overlay_path = os.path.join(app.config['UPLOAD_FOLDER'], overlay_input_filename)
+            
+            save_success, save_message = save_file_safely(overlay_file, overlay_path)
+            if not save_success:
+                if os.path.exists(main_path):
+                    os.remove(main_path)
+                return jsonify({'success': False, 'error': f'Failed to save overlay file: {save_message}'})
+            
+            # Build overlay filter
+            overlay_filter = '[1:v]'
+            
+            # Add scaling if specified
+            if scale_width and scale_height:
+                overlay_filter += f'scale={scale_width}:{scale_height},'
+            elif scale_width:
+                overlay_filter += f'scale={scale_width}:-1,'
+            elif scale_height:
+                overlay_filter += f'scale=-1:{scale_height},'
+            
+            # Add opacity if not 1.0
+            if opacity != 1.0:
+                overlay_filter += f'format=rgba,colorchannelmixer=aa={opacity},'
+            
+            overlay_filter += f'[ovr];[0:v][ovr]overlay={x_pos}:{y_pos}[out]'
+            
+            cmd = [
+                'ffmpeg', '-i', main_path, '-i', overlay_path,
+                '-filter_complex', overlay_filter,
+                '-map', '[out]', '-map', '0:a?',
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-crf', '23',
+                '-preset', 'medium',
+                '-movflags', '+faststart',
+                '-pix_fmt', 'yuv420p',
+                '-y', output_path
+            ]
+            
+        else:
+            if os.path.exists(main_path):
+                os.remove(main_path)
+            return jsonify({'success': False, 'error': 'Invalid overlay type. Supported: text, image, video'})
+
+        # Execute FFmpeg command
+        success, message = run_ffmpeg_command(cmd, timeout=600)
+        
+        # Cleanup input files
+        if os.path.exists(main_path):
+            os.remove(main_path)
+        if overlay_type in ['image', 'video'] and 'overlay_path' in locals() and os.path.exists(overlay_path):
+            os.remove(overlay_path)
+        
+        if not success:
+            return jsonify({'success': False, 'error': f'Overlay processing failed: {message}'})
+        
+        return jsonify({
+            'success': True, 
+            'output_file': output_filename,
+            'message': f'{overlay_type.title()} overlay added successfully'
+        })
+
+    except Exception as e:
+        print(f"Error in add_overlay: {str(e)}")
+        # Cleanup on error
+        if 'main_path' in locals() and os.path.exists(main_path):
+            os.remove(main_path)
+        if 'overlay_path' in locals() and os.path.exists(overlay_path):
+            os.remove(overlay_path)
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/add-text-overlay', methods=['POST'])
+@login_required
+def add_text_overlay():
+    """Add text overlay with advanced styling options"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'Video file is required.'})
+
+        file = request.files['file']
+        text_content = request.form.get('text', 'Sample Text')
+        position = request.form.get('position', 'bottom-center')
+        font_size = int(request.form.get('font_size', 24))
+        font_color = request.form.get('font_color', 'white')
+        background_color = request.form.get('background_color', '')
+        duration = float(request.form.get('duration', 0))  # 0 = entire video
+        start_time = float(request.form.get('start_time', 0))
+        
+        timestamp = int(time.time())
+        
+        # Save input file
+        filename = secure_filename(file.filename)
+        input_filename = f"{timestamp}_{filename}"
+        input_path = os.path.join(app.config['UPLOAD_FOLDER'], input_filename)
+        
+        save_success, save_message = save_file_safely(file, input_path)
+        if not save_success:
+            return jsonify({'success': False, 'error': f'Failed to save video: {save_message}'})
+
+        # Validate video
+        validate_success, validate_message = validate_and_repair_video_file(input_path, 1)
+        if not validate_success:
+            if os.path.exists(input_path):
+                os.remove(input_path)
+            return jsonify({'success': False, 'error': validate_message})
+
+        output_filename = f'text_overlay_{timestamp}.mp4'
+        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+
+        # Position mapping
+        pos_map = {
+            'top-left': '10:10',
+            'top-center': '(w-text_w)/2:10',
+            'top-right': 'w-text_w-10:10',
+            'center-left': '10:(h-text_h)/2',
+            'center': '(w-text_w)/2:(h-text_h)/2',
+            'center-right': 'w-text_w-10:(h-text_h)/2',
+            'bottom-left': '10:h-text_h-10',
+            'bottom-center': '(w-text_w)/2:h-text_h-10',
+            'bottom-right': 'w-text_w-10:h-text_h-10'
+        }
+        
+        text_pos = pos_map.get(position, '(w-text_w)/2:h-text_h-10')
+        
+        # Build text filter
+        text_filter = f'drawtext=text=\'{text_content}\':fontsize={font_size}:fontcolor={font_color}:x={text_pos}'
+        
+        # Add background if specified
+        if background_color:
+            text_filter += f':box=1:boxcolor={background_color}:boxborderw=5'
+        
+        # Add timing if specified
+        if duration > 0:
+            end_time = start_time + duration
+            text_filter += f':enable=\'between(t,{start_time},{end_time})\''
+        elif start_time > 0:
+            text_filter += f':enable=\'gte(t,{start_time})\''
+
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vf', text_filter,
+            '-c:v', 'libx264',
+            '-c:a', 'copy',
+            '-crf', '23',
+            '-preset', 'medium',
+            '-movflags', '+faststart',
+            '-pix_fmt', 'yuv420p',
+            '-y', output_path
+        ]
+
+        success, message = run_ffmpeg_command(cmd, timeout=600)
+        
+        # Cleanup
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        
+        if not success:
+            return jsonify({'success': False, 'error': f'Text overlay failed: {message}'})
+        
+        return jsonify({
+            'success': True, 
+            'output_file': output_filename,
+            'message': f'Text overlay "{text_content}" added successfully'
+        })
+
+    except Exception as e:
+        print(f"Error in add_text_overlay: {str(e)}")
+        if 'input_path' in locals() and os.path.exists(input_path):
+            os.remove(input_path)
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/add-image-overlay', methods=['POST'])
+@login_required
+def add_image_overlay():
+    """Add image overlay with positioning and scaling options"""
+    try:
+        if 'video_file' not in request.files or 'image_file' not in request.files:
+            return jsonify({'success': False, 'error': 'Both video and image files are required.'})
+
+        video_file = request.files['video_file']
+        image_file = request.files['image_file']
+        
+        x_pos = int(request.form.get('x_pos', 10))
+        y_pos = int(request.form.get('y_pos', 10))
+        scale_width = request.form.get('scale_width', '')
+        scale_height = request.form.get('scale_height', '')
+        opacity = float(request.form.get('opacity', 1.0))
+        position = request.form.get('position', 'custom')
+        
+        timestamp = int(time.time())
+        
+        # Save video file
+        video_filename = secure_filename(video_file.filename)
+        video_input_filename = f"{timestamp}_video_{video_filename}"
+        video_path = os.path.join(app.config['UPLOAD_FOLDER'], video_input_filename)
+        
+        save_success, save_message = save_file_safely(video_file, video_path)
+        if not save_success:
+            return jsonify({'success': False, 'error': f'Failed to save video: {save_message}'})
+
+        # Save image file
+        image_filename = secure_filename(image_file.filename)
+        image_input_filename = f"{timestamp}_image_{image_filename}"
+        image_path = os.path.join(app.config['UPLOAD_FOLDER'], image_input_filename)
+        
+        save_success, save_message = save_file_safely(image_file, image_path)
+        if not save_success:
+            if os.path.exists(video_path):
+                os.remove(video_path)
+            return jsonify({'success': False, 'error': f'Failed to save image: {save_message}'})
+
+        # Validate video
+        validate_success, validate_message = validate_and_repair_video_file(video_path, 1)
+        if not validate_success:
+            if os.path.exists(video_path):
+                os.remove(video_path)
+            if os.path.exists(image_path):
+                os.remove(image_path)
+            return jsonify({'success': False, 'error': validate_message})
+
+        output_filename = f'image_overlay_{timestamp}.mp4'
+        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+
+        # Position presets
+        if position != 'custom':
+            pos_map = {
+                'top-left': '10:10',
+                'top-right': 'main_w-overlay_w-10:10',
+                'bottom-left': '10:main_h-overlay_h-10',
+                'bottom-right': 'main_w-overlay_w-10:main_h-overlay_h-10',
+                'center': '(main_w-overlay_w)/2:(main_h-overlay_h)/2'
+            }
+            overlay_pos = pos_map.get(position, f'{x_pos}:{y_pos}')
+        else:
+            overlay_pos = f'{x_pos}:{y_pos}'
+
+        # Build overlay filter
+        overlay_filter = '[1:v]'
+        
+        # Add scaling if specified
+        if scale_width and scale_height:
+            overlay_filter += f'scale={scale_width}:{scale_height},'
+        elif scale_width:
+            overlay_filter += f'scale={scale_width}:-1,'
+        elif scale_height:
+            overlay_filter += f'scale=-1:{scale_height},'
+        
+        # Add opacity if not 1.0
+        if opacity != 1.0:
+            overlay_filter += f'format=rgba,colorchannelmixer=aa={opacity},'
+        
+        overlay_filter += f'[ovr];[0:v][ovr]overlay={overlay_pos}[out]'
+
+        cmd = [
+            'ffmpeg', '-i', video_path, '-i', image_path,
+            '-filter_complex', overlay_filter,
+            '-map', '[out]', '-map', '0:a?',
+            '-c:v', 'libx264',
+            '-c:a', 'aac',
+            '-crf', '23',
+            '-preset', 'medium',
+            '-movflags', '+faststart',
+            '-pix_fmt', 'yuv420p',
+            '-y', output_path
+        ]
+
+        success, message = run_ffmpeg_command(cmd, timeout=600)
+        
+        # Cleanup
+        if os.path.exists(video_path):
+            os.remove(video_path)
+        if os.path.exists(image_path):
+            os.remove(image_path)
+        
+        if not success:
+            return jsonify({'success': False, 'error': f'Image overlay failed: {message}'})
+        
+        return jsonify({
+            'success': True, 
+            'output_file': output_filename,
+            'message': 'Image overlay added successfully'
+        })
+
+    except Exception as e:
+        print(f"Error in add_image_overlay: {str(e)}")
+        if 'video_path' in locals() and os.path.exists(video_path):
+            os.remove(video_path)
+        if 'image_path' in locals() and os.path.exists(image_path):
+            os.remove(image_path)
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/add-video-overlay', methods=['POST'])
+@login_required
+def add_video_overlay():
+    """Add video overlay (picture-in-picture effect)"""
+    try:
+        if 'main_video' not in request.files or 'overlay_video' not in request.files:
+            return jsonify({'success': False, 'error': 'Both main and overlay video files are required.'})
+
+        main_video = request.files['main_video']
+        overlay_video = request.files['overlay_video']
+        
+        x_pos = int(request.form.get('x_pos', 10))
+        y_pos = int(request.form.get('y_pos', 10))
+        scale_width = request.form.get('scale_width', '320')
+        scale_height = request.form.get('scale_height', '240')
+        opacity = float(request.form.get('opacity', 1.0))
+        position = request.form.get('position', 'custom')
+        
+        timestamp = int(time.time())
+        
+        # Save main video
+        main_filename = secure_filename(main_video.filename)
+        main_input_filename = f"{timestamp}_main_{main_filename}"
+        main_path = os.path.join(app.config['UPLOAD_FOLDER'], main_input_filename)
+        
+        save_success, save_message = save_file_safely(main_video, main_path)
+        if not save_success:
+            return jsonify({'success': False, 'error': f'Failed to save main video: {save_message}'})
+
+        # Save overlay video
+        overlay_filename = secure_filename(overlay_video.filename)
+        overlay_input_filename = f"{timestamp}_overlay_{overlay_filename}"
+        overlay_path = os.path.join(app.config['UPLOAD_FOLDER'], overlay_input_filename)
+        
+        save_success, save_message = save_file_safely(overlay_video, overlay_path)
+        if not save_success:
+            if os.path.exists(main_path):
+                os.remove(main_path)
+            return jsonify({'success': False, 'error': f'Failed to save overlay video: {save_message}'})
+
+        # Validate both videos
+        validate_success, validate_message = validate_and_repair_video_file(main_path, 1)
+        if not validate_success:
+            if os.path.exists(main_path):
+                os.remove(main_path)
+            if os.path.exists(overlay_path):
+                os.remove(overlay_path)
+            return jsonify({'success': False, 'error': f'Main video: {validate_message}'})
+
+        validate_success, validate_message = validate_and_repair_video_file(overlay_path, 2)
+        if not validate_success:
+            if os.path.exists(main_path):
+                os.remove(main_path)
+            if os.path.exists(overlay_path):
+                os.remove(overlay_path)
+            return jsonify({'success': False, 'error': f'Overlay video: {validate_message}'})
+
+        output_filename = f'video_overlay_{timestamp}.mp4'
+        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+
+        # Position presets
+        if position != 'custom':
+            pos_map = {
+                'top-left': '10:10',
+                'top-right': 'main_w-overlay_w-10:10',
+                'bottom-left': '10:main_h-overlay_h-10',
+                'bottom-right': 'main_w-overlay_w-10:main_h-overlay_h-10',
+                'center': '(main_w-overlay_w)/2:(main_h-overlay_h)/2'
+            }
+            overlay_pos = pos_map.get(position, f'{x_pos}:{y_pos}')
+        else:
+            overlay_pos = f'{x_pos}:{y_pos}'
+
+        # Build overlay filter
+        overlay_filter = f'[1:v]scale={scale_width}:{scale_height}'
+        
+        # Add opacity if not 1.0
+        if opacity != 1.0:
+            overlay_filter += f',format=rgba,colorchannelmixer=aa={opacity}'
+        
+        overlay_filter += f'[ovr];[0:v][ovr]overlay={overlay_pos}[out]'
+
+        cmd = [
+            'ffmpeg', '-i', main_path, '-i', overlay_path,
+            '-filter_complex', overlay_filter,
+            '-map', '[out]', '-map', '0:a?',
+            '-c:v', 'libx264',
+            '-c:a', 'aac',
+            '-crf', '23',
+            '-preset', 'medium',
+            '-movflags', '+faststart',
+            '-pix_fmt', 'yuv420p',
+            '-y', output_path
+        ]
+
+        success, message = run_ffmpeg_command(cmd, timeout=600)
+        
+        # Cleanup
+        if os.path.exists(main_path):
+            os.remove(main_path)
+        if os.path.exists(overlay_path):
+            os.remove(overlay_path)
+        
+        if not success:
+            return jsonify({'success': False, 'error': f'Video overlay failed: {message}'})
+        
+        return jsonify({
+            'success': True, 
+            'output_file': output_filename,
+            'message': 'Video overlay (picture-in-picture) added successfully'
+        })
+
+    except Exception as e:
+        print(f"Error in add_video_overlay: {str(e)}")
+        if 'main_path' in locals() and os.path.exists(main_path):
+            os.remove(main_path)
+        if 'overlay_path' in locals() and os.path.exists(overlay_path):
+            os.remove(overlay_path)
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/compress-video', methods=['POST'])
+@login_required
+def compress_video():
+    """Fast video compression using direct FFmpeg"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'No file uploaded'})
+        
+        file = request.files['file']
+        quality = request.form.get('quality', 'medium')  # low, medium, high
+        
+        if not file:
+            return jsonify({'success': False, 'error': 'No file selected'})
+        
+        # Save uploaded file
+        filename = secure_filename(file.filename)
+        timestamp = int(time.time())
+        input_filename = f"{timestamp}_{filename}"
+        input_path = os.path.join(app.config['UPLOAD_FOLDER'], input_filename)
+        file.save(input_path)
+        
+        # Get original file size
+        original_size = os.path.getsize(input_path)
+        
+        # Set compression parameters based on quality
+        if quality == 'high':
+            crf, preset = 18, 'slow'
+        elif quality == 'low':
+            crf, preset = 28, 'ultrafast'
+        else:  # medium
+            crf, preset = 23, 'medium'
+        
+        # Generate output filename
+        output_filename = f"compressed_{timestamp}.mp4"
+        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+        
+        # Use direct FFmpeg for compression
+        if ffmpeg_available:
+            success, message = compress_video_ffmpeg(input_path, output_path, crf, preset)
+        else:
+            # Fallback to MoviePy
+            video = mp.VideoFileClip(input_path)
+            video.write_videofile(
+                output_path,
+                codec='libx264',
+                preset=preset,
+                ffmpeg_params=['-crf', str(crf)]
+            )
+            video.close()
+            success, message = True, "Video compressed with MoviePy"
+        
+        if not success:
+            if os.path.exists(input_path):
+                os.remove(input_path)
+            return jsonify({'success': False, 'error': message})
+        
+        # Get compressed file size
+        compressed_size = os.path.getsize(output_path)
+        compression_ratio = f"{((original_size - compressed_size) / original_size * 100):.1f}%"
+        
+        # Clean up input file
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        
+        return jsonify({
+            'success': True,
+            'output_file': output_filename,
+            'original_size': f"{original_size / (1024*1024):.1f} MB",
+            'compressed_size': f"{compressed_size / (1024*1024):.1f} MB",
+            'compression_ratio': compression_ratio,
+            'method': 'FFmpeg' if ffmpeg_available else 'MoviePy'
+        })
+        
+    except Exception as e:
+        # Clean up files on error
+        if 'input_path' in locals() and os.path.exists(input_path):
+            os.remove(input_path)
+        if 'output_path' in locals() and os.path.exists(output_path):
+            os.remove(output_path)
+        
+        return jsonify({'success': False, 'error': f'Server error: {str(e)}'})
+
+@app.route('/fast-trim', methods=['POST'])
+@login_required
+def fast_trim():
+    """Ultra-fast video trimming using direct FFmpeg (no re-encoding)"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'No file uploaded'})
+        
+        file = request.files['file']
+        start_time = float(request.form.get('start_time', 0))
+        end_time = float(request.form.get('end_time', 0))
+        
+        if not file:
+            return jsonify({'success': False, 'error': 'No file selected'})
+        
+        # Save the uploaded file
+        filename = secure_filename(file.filename)
+        timestamp = int(time.time())
+        input_filename = f"{timestamp}_{filename}"
+        input_path = os.path.join(app.config['UPLOAD_FOLDER'], input_filename)
+        file.save(input_path)
+        
+        # Generate output filename
+        output_filename = f'fast_trim_{timestamp}.mp4'
+        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+        
+        # Use direct FFmpeg for ultra-fast trimming
+        if ffmpeg_available:
+            success, message = trim_video_ffmpeg(input_path, output_path, start_time, end_time)
+        else:
+            # Fallback to MoviePy
+            video = mp.VideoFileClip(input_path)
+            trimmed = video.subclip(start_time, end_time)
+            trimmed.write_videofile(output_path)
+            video.close()
+            trimmed.close()
+            success, message = True, "Video trimmed with MoviePy"
+        
+        # Clean up input file
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        
+        if not success:
+            return jsonify({'success': False, 'error': message})
+        
+        return jsonify({
+            'success': True,
+            'output_file': output_filename,
+            'method': 'FFmpeg (no re-encoding)' if ffmpeg_available else 'MoviePy'
+        })
+        
+    except Exception as e:
+        print(f"Error in fast_trim: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/process-multi-prompt', methods=['POST'])
+@login_required
+def process_multi_prompt():
+    """Process text prompts for multi-video operations"""
+    input_paths = []
+    
+    try:
+        if 'files[]' not in request.files:
+            return jsonify({'success': False, 'error': 'No files uploaded'})
+        
+        files = request.files.getlist('files[]')
+        prompt = request.form.get('prompt', '').lower().strip()
+        
+        if not prompt:
+            return jsonify({'success': False, 'error': 'No prompt provided'})
+        
+        if len(files) < 2:
+            return jsonify({'success': False, 'error': 'Multi-video operations require at least 2 videos'})
+        
+        timestamp = int(time.time())
+        
+        # Save uploaded files
+        for i, file in enumerate(files):
+            if file and file.filename:
+                filename = secure_filename(file.filename)
+                input_filename = f"{timestamp}_{i}_{filename}"
+                input_path = os.path.join(app.config['UPLOAD_FOLDER'], input_filename)
+                file.save(input_path)
+                input_paths.append(input_path)
+        
+        print(f"Processing multi-video prompt: '{prompt}' with {len(input_paths)} videos")
+        
+        # Parse prompt and execute corresponding action
+        if any(word in prompt for word in ['merge', 'combine', 'join', 'concatenate', 'stitch']):
+            return handle_merge_prompt(input_paths, prompt, timestamp)
+        
+        elif any(word in prompt for word in ['transition', 'fade', 'dissolve', 'crossfade', 'blend']):
+            return handle_transition_prompt(input_paths, prompt, timestamp)
+        
+        elif any(word in prompt for word in ['overlay', 'picture in picture', 'pip', 'composite']):
+            return handle_overlay_prompt(input_paths, prompt, timestamp)
+        
+        elif any(word in prompt for word in ['side by side', 'split screen', 'compare']):
+            return handle_split_screen_prompt(input_paths, prompt, timestamp)
+        
+        else:
+            # Clean up files
+            for path in input_paths:
+                if os.path.exists(path):
+                    os.remove(path)
+            
+            return jsonify({
+                'success': False, 
+                'error': 'Prompt not recognized. Try: "merge videos", "fade transition", "overlay videos", "side by side"'
+            })
+        
+    except Exception as e:
+        print(f"Error in process_multi_prompt: {str(e)}")
+        # Clean up files on error
+        for path in input_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        return jsonify({'success': False, 'error': f'Multi-prompt error: {str(e)}'})
+
+def handle_merge_prompt(input_paths, prompt, timestamp):
+    """Handle merge-related prompts"""
+    try:
+        print(f"Handling merge prompt for {len(input_paths)} videos...")
+        
+        # Generate output filename
+        output_filename = f'prompt_merged_{timestamp}.mp4'
+        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+        
+        # Normalize all videos first
+        normalized_paths = []
+        
+        for i, input_path in enumerate(input_paths):
+            norm_filename = f"merge_norm_{timestamp}_{i}.mp4"
+            norm_path = os.path.join(app.config['UPLOAD_FOLDER'], norm_filename)
+            
+            # Normalize video to consistent format
+            norm_cmd = [
+                'ffmpeg', '-i', input_path,
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
+                '-r', '30',
+                '-ar', '44100',
+                '-ac', '2',
+                '-crf', '23',
+                '-preset', 'medium',
+                '-pix_fmt', 'yuv420p',
+                '-y', norm_path
+            ]
+            
+            success, message = run_ffmpeg_command(norm_cmd, timeout=300)
+            if not success:
+                # Clean up and return error
+                for path in input_paths + normalized_paths:
+                    if os.path.exists(path):
+                        os.remove(path)
+                return jsonify({'success': False, 'error': f'Failed to normalize video {i+1}: {message}'})
+            
+            normalized_paths.append(norm_path)
+        
+        # Create concat file
+        concat_file = os.path.join(app.config['UPLOAD_FOLDER'], f'prompt_concat_{timestamp}.txt')
+        with open(concat_file, 'w', encoding='utf-8') as f:
+            for path in normalized_paths:
+                normalized_path = path.replace('\\', '/')
+                f.write(f"file '{normalized_path}'\n")
+        
+        # Merge videos
+        merge_cmd = [
+            'ffmpeg', '-f', 'concat', '-safe', '0', '-i', concat_file,
+            '-c', 'copy',
+            '-y', output_path
+        ]
+        
+        success, message = run_ffmpeg_command(merge_cmd, timeout=600)
+        
+        # Clean up
+        for path in input_paths + normalized_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        if os.path.exists(concat_file):
+            os.remove(concat_file)
+        
+        if not success:
+            return jsonify({'success': False, 'error': f'Merge failed: {message}'})
+        
+        return jsonify({
+            'success': True,
+            'output_file': output_filename,
+            'message': f'Successfully merged {len(input_paths)} videos using text prompt'
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Merge prompt error: {str(e)}'})
+
+def handle_transition_prompt(input_paths, prompt, timestamp):
+    """Handle transition-related prompts"""
+    try:
+        print(f"Handling transition prompt for {len(input_paths)} videos...")
+        
+        # Extract transition type and duration from prompt
+        transition_type = 'fade'  # default
+        duration = 1.0  # default
+        
+        if 'dissolve' in prompt:
+            transition_type = 'dissolve'
+        elif 'wipe' in prompt:
+            transition_type = 'wipe'
+        elif 'cut' in prompt:
+            transition_type = 'cut'
+        
+        # Extract duration if specified
+        import re
+        duration_match = re.search(r'(\d+\.?\d*)\s*(?:second|sec|s)', prompt)
+        if duration_match:
+            duration = float(duration_match.group(1))
+        
+        # Generate output filename
+        output_filename = f'prompt_transition_{transition_type}_{timestamp}.mp4'
+        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+        
+        # Normalize all videos first
+        normalized_paths = []
+        
+        for i, input_path in enumerate(input_paths):
+            norm_filename = f"trans_norm_{timestamp}_{i}.mp4"
+            norm_path = os.path.join(app.config['UPLOAD_FOLDER'], norm_filename)
+            
+            # Normalize video to consistent format
+            norm_cmd = [
+                'ffmpeg', '-i', input_path,
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
+                '-r', '30',
+                '-ar', '44100',
+                '-ac', '2',
+                '-crf', '23',
+                '-preset', 'medium',
+                '-pix_fmt', 'yuv420p',
+                '-y', norm_path
+            ]
+            
+            success, message = run_ffmpeg_command(norm_cmd, timeout=300)
+            if not success:
+                # Clean up and return error
+                for path in input_paths + normalized_paths:
+                    if os.path.exists(path):
+                        os.remove(path)
+                return jsonify({'success': False, 'error': f'Failed to normalize video {i+1}: {message}'})
+            
+            normalized_paths.append(norm_path)
+        
+        # Apply transition based on type
+        if transition_type in ['fade', 'dissolve'] and len(normalized_paths) == 2:
+            # Use xfade for 2 videos
+            transition_cmd = [
+                'ffmpeg', '-i', normalized_paths[0], '-i', normalized_paths[1],
+                '-filter_complex',
+                f'[0:v][1:v]xfade=transition={transition_type}:duration={duration}:offset=5[v];'
+                f'[0:a][1:a]acrossfade=d={duration}[a]',
+                '-map', '[v]', '-map', '[a]',
+                '-c:v', 'libx264', '-c:a', 'aac',
+                '-crf', '23', '-preset', 'medium',
+                '-movflags', '+faststart',
+                '-pix_fmt', 'yuv420p',
+                '-y', output_path
+            ]
+            
+            success, message = run_ffmpeg_command(transition_cmd, timeout=600)
+        
+        elif transition_type == 'wipe' and len(normalized_paths) == 2:
+            # Wipe transition
+            wipe_cmd = [
+                'ffmpeg', '-i', normalized_paths[0], '-i', normalized_paths[1],
+                '-filter_complex',
+                f'[0:v][1:v]xfade=transition=wipeleft:duration={duration}:offset=5[v];'
+                f'[0:a][1:a]acrossfade=d={duration}[a]',
+                '-map', '[v]', '-map', '[a]',
+                '-c:v', 'libx264', '-c:a', 'aac',
+                '-crf', '23', '-preset', 'medium',
+                '-movflags', '+faststart',
+                '-pix_fmt', 'yuv420p',
+                '-y', output_path
+            ]
+            
+            success, message = run_ffmpeg_command(wipe_cmd, timeout=600)
+        
+        else:
+            # For multiple videos or cut transition, use concat
+            concat_file = os.path.join(app.config['UPLOAD_FOLDER'], f'trans_concat_{timestamp}.txt')
+            with open(concat_file, 'w', encoding='utf-8') as f:
+                for path in normalized_paths:
+                    normalized_path = path.replace('\\', '/')
+                    f.write(f"file '{normalized_path}'\n")
+            
+            if transition_type == 'fade':
+                # Apply fade effects
+                fade_cmd = [
+                    'ffmpeg', '-f', 'concat', '-safe', '0', '-i', concat_file,
+                    '-vf', f'fade=in:0:{int(duration*30)},fade=out:st={max(0, 30-duration)}:d={duration}',
+                    '-af', f'afade=in:st=0:d={duration},afade=out:st={max(0, 30-duration)}:d={duration}',
+                    '-c:v', 'libx264', '-c:a', 'aac',
+                    '-crf', '23', '-preset', 'medium',
+                    '-movflags', '+faststart',
+                    '-pix_fmt', 'yuv420p',
+                    '-y', output_path
+                ]
+            else:
+                # Simple concatenation
+                fade_cmd = [
+                    'ffmpeg', '-f', 'concat', '-safe', '0', '-i', concat_file,
+                    '-c', 'copy',
+                    '-y', output_path
+                ]
+            
+            success, message = run_ffmpeg_command(fade_cmd, timeout=600)
+            
+            if os.path.exists(concat_file):
+                os.remove(concat_file)
+        
+        # Clean up
+        for path in input_paths + normalized_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        
+        if not success:
+            return jsonify({'success': False, 'error': f'Transition failed: {message}'})
+        
+        return jsonify({
+            'success': True,
+            'output_file': output_filename,
+            'message': f'Applied {transition_type} transitions using FFmpeg'
+        })
+        
+    except Exception as e:
+        print(f"Error in apply_transition: {str(e)}")
+        # Clean up files on error
+        for path in input_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        return jsonify({'success': False, 'error': f'Transition error: {str(e)}'})
+
+@app.route('/process-prompt', methods=['POST'])
+@login_required
+def process_prompt():
+    """
+    Advanced text prompt processor for video editing commands
+    
+    Supported Commands:
+    - trim start=X end=Y
+    - resize width=X height=Y
+    - speed factor=X
+    - extract_audio format=mp3|wav
+    - color_grade brightness=X contrast=Y saturation=Z
+    - color_grade preset=cinematic|vintage|warm|cool|noir|vibrant
+    - speed_ramp start=X end=Y factor=Z
+    - effect type=blur|glow|vignette|freeze_frame|motion_blur|sepia|negative|mirror|pixelate|edge_detection strength=X
+    - animation type=zoom|pan|fade|bounce|rotate|slide start=X end=Y scale=Z angle=A direction=left|right|up|down
+    - merge_videos files=file1.mp4,file2.mp4 transition=type duration=X
+    - overlay type=text|image|video content="X" x=Y y=Z duration=W position=top|bottom|center-left|right|center
+    - transition type=crossfade|slide|wipe|fade duration=X direction=left|right|up|down
+    """
+    
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'No main file uploaded'})
+        
+        main_file = request.files['file']
+        prompt = request.form.get('prompt', '').strip()
+        
+        if not prompt:
+            return jsonify({'success': False, 'error': 'No prompt provided'})
+        
+        print(f"Processing prompt: {prompt}")
+        
+        # Don't save main file yet - let the command handler do it properly
+        main_filename = secure_filename(main_file.filename)
+        timestamp = int(time.time())
+        main_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{timestamp}_{main_filename}")
+        
+        # Check if auxiliary files are provided for multi-video operations
+        auxiliary_files = request.files.getlist('aux_files[]') if 'aux_files[]' in request.files else []
+        
+        # Check if this is a command that needs auxiliary files but also needs main file saved
+        prompt_lower = prompt.lower().strip()
+        needs_main_file_saved = (
+            prompt_lower.startswith('overlay') or 
+            prompt_lower.startswith('trim') or 
+            prompt_lower.startswith('resize') or 
+            prompt_lower.startswith('speed') or 
+            prompt_lower.startswith('extract_audio') or 
+            prompt_lower.startswith('color_grade') or 
+            prompt_lower.startswith('speed_ramp') or 
+            prompt_lower.startswith('effect') or 
+            prompt_lower.startswith('animation')
+        )
+        
+        print(f"Command type: {prompt_lower.split()[0] if prompt_lower else 'unknown'}")
+        print(f"Needs main file saved: {needs_main_file_saved}")
+        print(f"Auxiliary files count: {len(auxiliary_files)}")
+        
+        # If auxiliary files are provided, combine with main file for multi-video operations
+        if auxiliary_files and len(auxiliary_files) > 0:
+            # For overlay commands, save the main file first since it's needed
+            if needs_main_file_saved:
+                save_success, save_message = save_file_safely(main_file, main_path)
+                if not save_success:
+                    return jsonify({'success': False, 'error': f'Failed to save main video file: {save_message}'})
+            
+            # Create a combined files object for commands that need auxiliary files
+            from werkzeug.datastructures import MultiDict
+            combined_files = MultiDict()
+            
+            # For multi-video operations (merge, transition), add main file to the list
+            if not needs_main_file_saved:
+                combined_files.add('files[]', main_file)
+            
+            # Add auxiliary files
+            for aux_file in auxiliary_files:
+                if aux_file and aux_file.filename:
+                    combined_files.add('files[]', aux_file)
+            
+            # Parse command and parameters with combined files
+            command_result = parse_and_execute_command(prompt, main_path, combined_files, timestamp)
+        else:
+            # For single-video operations, save the main file first
+            save_success, save_message = save_file_safely(main_file, main_path)
+            if not save_success:
+                return jsonify({'success': False, 'error': f'Failed to save main video file: {save_message}'})
+            
+            # Parse command and parameters for single-video operations
+            command_result = parse_and_execute_command(prompt, main_path, request.files, timestamp)
+        
+        # Clean up main file
+        if os.path.exists(main_path):
+            os.remove(main_path)
+        
+        return jsonify(command_result)
+        
+    except Exception as e:
+        print(f"Error in process_prompt: {str(e)}")
+        if 'main_path' in locals() and os.path.exists(main_path):
+            os.remove(main_path)
+        return jsonify({'success': False, 'error': str(e)})
+
+def parse_and_execute_command(prompt, main_path, files, timestamp):
+    """Parse and execute video editing commands from text prompts"""
+    
+    # Normalize prompt
+    prompt = prompt.lower().strip()
+    
+    try:
+        # TRIM COMMAND
+        if prompt.startswith('trim'):
+            return execute_trim_command(prompt, main_path, timestamp)
+        
+        # RESIZE COMMAND
+        elif prompt.startswith('resize'):
+            return execute_resize_command(prompt, main_path, timestamp)
+        
+        # SPEED COMMAND
+        elif prompt.startswith('speed'):
+            return execute_speed_command(prompt, main_path, timestamp)
+        
+        # EXTRACT AUDIO COMMAND
+        elif prompt.startswith('extract_audio'):
+            return execute_extract_audio_command(prompt, main_path, timestamp)
+        
+        # COLOR GRADE COMMAND
+        elif prompt.startswith('color_grade'):
+            return execute_color_grade_command(prompt, main_path, timestamp)
+        
+        # SPEED RAMP COMMAND
+        elif prompt.startswith('speed_ramp'):
+            return execute_speed_ramp_command(prompt, main_path, timestamp)
+        
+        # EFFECT COMMAND
+        elif prompt.startswith('effect'):
+            return execute_effect_command(prompt, main_path, timestamp)
+        
+        # ANIMATION COMMAND
+        elif prompt.startswith('animation'):
+            return execute_animation_command(prompt, main_path, timestamp)
+        
+        # OVERLAY COMMAND
+        elif prompt.startswith('overlay'):
+            return execute_overlay_command(prompt, main_path, files, timestamp)
+        
+        # MERGE VIDEOS COMMAND
+        elif prompt.startswith('merge_videos'):
+            return execute_merge_command(prompt, files, timestamp)
+        
+        # TRANSITION COMMAND
+        elif prompt.startswith('transition'):
+            return execute_transition_command(prompt, files, timestamp)
+        
+        else:
+            return {
+                'success': False, 
+                'error': f'Unknown command. Supported commands: trim, resize, speed, extract_audio, color_grade, speed_ramp, effect, animation, overlay, merge_videos, transition'
+            }
+            
+    except Exception as e:
+        return {'success': False, 'error': f'Command execution failed: {str(e)}'}
+
+def parse_parameters(param_string):
+    """Parse parameters from command string"""
+    params = {}
+    
+    # Handle quoted strings
+    import re
+    quoted_matches = re.findall(r'(\w+)="([^"]*)"', param_string)
+    for key, value in quoted_matches:
+        params[key] = value
+        param_string = re.sub(f'{key}="{value}"', '', param_string)
+    
+    # Handle regular parameters
+    param_matches = re.findall(r'(\w+)=([^\s]+)', param_string)
+    for key, value in param_matches:
+        # Try to convert to appropriate type
+        try:
+            if '.' in value:
+                params[key] = float(value)
+            elif value.isdigit():
+                params[key] = int(value)
+            else:
+                params[key] = value
+        except:
+            params[key] = value
+    
+    return params
+
+def execute_trim_command(prompt, main_path, timestamp):
+    """Execute trim command: trim start=X end=Y"""
+    params = parse_parameters(prompt)
+    
+    start_time = params.get('start', 0)
+    end_time = params.get('end', None)
+    
+    if end_time is None:
+        return {'success': False, 'error': 'Trim command requires both start and end parameters'}
+    
+    # Use the existing trim_video function logic
+    output_filename = f'prompt_trim_{timestamp}.mp4'
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+    
+    # Calculate duration
+    duration = end_time - start_time
+    
+    # FFmpeg command for trimming (using existing proven approach)
+    cmd = [
+        'ffmpeg', '-i', main_path,
+        '-ss', str(start_time),
+        '-t', str(duration),
+        '-c:v', 'libx264',
+        '-c:a', 'aac',
+        '-crf', '18',
+        '-preset', 'fast',
+        '-movflags', '+faststart',
+        '-pix_fmt', 'yuv420p',
+        '-y', output_path
+    ]
+    
+    success, message = run_ffmpeg_command(cmd, timeout=300)
+    
+    if success:
+        return {'success': True, 'output_file': output_filename, 'message': f'Video trimmed from {start_time}s to {end_time}s'}
+    else:
+        return {'success': False, 'error': f'Trim failed: {message}'}
+
+def execute_resize_command(prompt, main_path, timestamp):
+    """Execute resize command: resize width=X height=Y"""
+    params = parse_parameters(prompt)
+    
+    width = params.get('width')
+    height = params.get('height')
+    
+    if not width or not height:
+        return {'success': False, 'error': 'Resize command requires both width and height parameters'}
+    
+    # Ensure dimensions are even (required for H.264)
+    width = int(width) - (int(width) % 2)
+    height = int(height) - (int(height) % 2)
+    
+    output_filename = f'prompt_resize_{timestamp}.mp4'
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+    
+    # Use existing resize logic
+    cmd = [
+        'ffmpeg', '-i', main_path,
+        '-vf', f'scale={width}:{height}',
+        '-c:v', 'libx264',
+        '-c:a', 'aac',
+        '-crf', '18',
+        '-preset', 'fast',
+        '-movflags', '+faststart',
+        '-pix_fmt', 'yuv420p',
+        '-y', output_path
+    ]
+    
+    success, message = run_ffmpeg_command(cmd, timeout=300)
+    
+    if success:
+        return {'success': True, 'output_file': output_filename, 'message': f'Video resized to {width}x{height}'}
+    else:
+        return {'success': False, 'error': f'Resize failed: {message}'}
+
+def execute_speed_command(prompt, main_path, timestamp):
+    """Execute speed command: speed factor=X"""
+    params = parse_parameters(prompt)
+    
+    factor = params.get('factor', 1.0)
+    
+    output_filename = f'prompt_speed_{timestamp}.mp4'
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+    
+    # Calculate video and audio filters
+    video_speed = f'setpts={1/factor}*PTS'
+    
+    # Handle audio speed (atempo filter has limitations)
+    audio_filters = []
+    remaining_factor = factor
+    
+    while remaining_factor > 2.0:
+        audio_filters.append("atempo=2.0")
+        remaining_factor /= 2.0
+    
+    while remaining_factor < 0.5:
+        audio_filters.append("atempo=0.5")
+        remaining_factor /= 0.5
+    
+    if remaining_factor != 1.0:
+        audio_filters.append(f"atempo={remaining_factor}")
+    
+    audio_filter_str = ",".join(audio_filters) if audio_filters else "anull"
+    
+    cmd = [
+        'ffmpeg', '-i', main_path,
+        '-filter_complex', f'[0:v]{video_speed}[v];[0:a]{audio_filter_str}[a]',
+        '-map', '[v]', '-map', '[a]',
+        '-c:v', 'libx264',
+        '-c:a', 'aac',
+        '-crf', '23',
+        '-preset', 'medium',
+        '-movflags', '+faststart',
+        '-pix_fmt', 'yuv420p',
+        '-y', output_path
+    ]
+    
+    success, message = run_ffmpeg_command(cmd, timeout=300)
+    
+    if success:
+        return {'success': True, 'output_file': output_filename, 'message': f'Video speed changed by factor {factor}'}
+    else:
+        return {'success': False, 'error': f'Speed change failed: {message}'}
+
+def execute_extract_audio_command(prompt, main_path, timestamp):
+    """Execute extract_audio command: extract_audio format=mp3|wav"""
+    params = parse_parameters(prompt)
+    
+    format_type = params.get('format', 'mp3').lower()
+    
+    if format_type not in ['mp3', 'wav']:
+        return {'success': False, 'error': 'Audio format must be mp3 or wav'}
+    
+    output_filename = f'prompt_audio_{timestamp}.{format_type}'
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+    
+    # Use existing extract_audio logic
+    if format_type == 'mp3':
+        cmd = [
+            'ffmpeg', '-i', main_path,
+            '-vn',
+            '-acodec', 'libmp3lame',
+            '-ab', '192k',
+            '-ar', '44100',
+            '-y', output_path
+        ]
+    else:  # wav
+        cmd = [
+            'ffmpeg', '-i', main_path,
+            '-vn',
+            '-acodec', 'pcm_s16le',
+            '-ar', '44100',
+            '-y', output_path
+        ]
+    
+    success, message = run_ffmpeg_command(cmd, timeout=300)
+    
+    if success:
+        return {'success': True, 'output_file': output_filename, 'message': f'Audio extracted as {format_type}'}
+    else:
+        return {'success': False, 'error': f'Audio extraction failed: {message}'}
+
+def execute_color_grade_command(prompt, main_path, timestamp):
+    """Execute color_grade command: color_grade brightness=X contrast=Y saturation=Z OR color_grade preset=cinematic"""
+    params = parse_parameters(prompt)
+    
+    output_filename = f'prompt_colorgrade_{timestamp}.mp4'
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+    
+    if 'preset' in params:
+        preset = params['preset']
+        
+        # Predefined color grading presets
+        if preset == 'cinematic':
+            vf = 'eq=brightness=0.1:contrast=1.2:saturation=0.9'
+        elif preset == 'vintage':
+            vf = 'eq=brightness=0.05:contrast=0.8:saturation=0.7'
+        elif preset == 'warm':
+            vf = 'colortemperature=4000'
+        elif preset == 'cool':
+            vf = 'colortemperature=7000'
+        elif preset == 'noir':
+            vf = 'hue=s=0'  # Black and white
+        elif preset == 'vibrant':
+            vf = 'eq=brightness=0.05:contrast=1.3:saturation=1.4'
+        else:
+            return {'success': False, 'error': f'Unknown preset: {preset}'}
+    else:
+        # Custom values
+        brightness = params.get('brightness', 0)
+        contrast = params.get('contrast', 1)
+        saturation = params.get('saturation', 1)
+        
+        vf = f'eq=brightness={brightness}:contrast={contrast}:saturation={saturation}'
+    
+    cmd = [
+        'ffmpeg', '-i', main_path,
+        '-vf', vf,
+        '-c:v', 'libx264',
+        '-c:a', 'copy',
+        '-crf', '23',
+        '-preset', 'medium',
+        '-movflags', '+faststart',
+        '-pix_fmt', 'yuv420p',
+        '-y', output_path
+    ]
+    
+    success, message = run_ffmpeg_command(cmd, timeout=300)
+    
+    if success:
+        return {'success': True, 'output_file': output_filename, 'message': 'Color grading applied'}
+    else:
+        return {'success': False, 'error': f'Color grading failed: {message}'}
+
+def execute_speed_ramp_command(prompt, main_path, timestamp):
+    """Execute speed_ramp command: speed_ramp start=X end=Y factor=Z"""
+    params = parse_parameters(prompt)
+    
+    start_time = params.get('start', 0)
+    end_time = params.get('end', 5)
+    factor = params.get('factor', 2.0)
+    
+    output_filename = f'prompt_speedramp_{timestamp}.mp4'
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+    
+    # Create speed ramp using setpts
+    vf = f'setpts=if(between(t,{start_time},{end_time}),PTS/{factor},PTS)'
+    
+    cmd = [
+        'ffmpeg', '-i', main_path,
+        '-vf', vf,
+        '-c:v', 'libx264',
+        '-c:a', 'aac',
+        '-crf', '23',
+        '-preset', 'medium',
+        '-movflags', '+faststart',
+        '-pix_fmt', 'yuv420p',
+        '-y', output_path
+    ]
+    
+    success, message = run_ffmpeg_command(cmd, timeout=300)
+    
+    if success:
+        return {'success': True, 'output_file': output_filename, 'message': f'Speed ramp applied from {start_time}s to {end_time}s'}
+    else:
+        return {'success': False, 'error': f'Speed ramp failed: {message}'}
+
+def execute_effect_command(prompt, main_path, timestamp):
+    """Execute effect command: effect type=blur|glow|vignette|freeze_frame|motion_blur|sepia|negative|mirror|pixelate|edge_detection strength=X"""
+    params = parse_parameters(prompt)
+    
+    effect_type = params.get('type', 'blur')
+    strength = params.get('strength', 1.0)
+    
+    output_filename = f'prompt_effect_{timestamp}.mp4'
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+    
+    # Define video filters for different effects
+    if effect_type == 'blur':
+        vf = f'gblur=sigma={strength * 2}'
+    elif effect_type == 'glow':
+        vf = f'gblur=sigma={strength},blend=all_mode=screen'
+    elif effect_type == 'vignette':
+        vf = f'vignette=angle=PI/4:x0=w/2:y0=h/2'
+    elif effect_type == 'sepia':
+        vf = 'colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131'
+    elif effect_type == 'negative':
+        vf = 'negate'
+    elif effect_type == 'mirror':
+        vf = 'hflip'
+    elif effect_type == 'pixelate':
+        scale_factor = max(1, int(10 / strength))
+        vf = f'scale=iw/{scale_factor}:ih/{scale_factor}:flags=neighbor,scale=iw*{scale_factor}:ih*{scale_factor}:flags=neighbor'
+    elif effect_type == 'edge_detection':
+        vf = 'edgedetect'
+    else:
+        return {'success': False, 'error': f'Unknown effect type: {effect_type}'}
+    
+    cmd = [
+        'ffmpeg', '-i', main_path,
+        '-vf', vf,
+        '-c:v', 'libx264',
+        '-c:a', 'copy',
+        '-crf', '23',
+        '-preset', 'medium',
+        '-movflags', '+faststart',
+        '-pix_fmt', 'yuv420p',
+        '-y', output_path
+    ]
+    
+    success, message = run_ffmpeg_command(cmd, timeout=300)
+    
+    if success:
+        return {'success': True, 'output_file': output_filename, 'message': f'{effect_type} effect applied'}
+    else:
+        return {'success': False, 'error': f'Effect failed: {message}'}
+
+def execute_animation_command(prompt, main_path, timestamp):
+    """Execute animation command: animation type=zoom|pan|fade|bounce|rotate|slide start=X end=Y scale=Z angle=A direction=left|right|up|down"""
+    params = parse_parameters(prompt)
+    
+    anim_type = params.get('type', 'zoom')
+    start_time = params.get('start', 0)
+    end_time = params.get('end', 5)
+    scale = params.get('scale', 1.5)
+    angle = params.get('angle', 45)
+    direction = params.get('direction', 'right')
+    
+    output_filename = f'prompt_animation_{timestamp}.mp4'
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+    
+    # Define animation filters
+    if anim_type == 'zoom':
+        vf = f'zoompan=z=if(between(t,{start_time},{end_time}),min(zoom+0.01,{scale}),1):d=1'
+    elif anim_type == 'fade':
+        vf = f'fade=in:st={start_time}:d={end_time-start_time}'
+    elif anim_type == 'rotate':
+        vf = f'rotate=if(between(t,{start_time},{end_time}),{angle}*PI/180*(t-{start_time})/({end_time}-{start_time}),0)'
+    elif anim_type == 'pan':
+        if direction == 'right':
+            vf = f'crop=iw/2:ih:if(between(t,{start_time},{end_time}),iw/2*(t-{start_time})/({end_time}-{start_time}),0):0'
+        elif direction == 'left':
+            vf = f'crop=iw/2:ih:if(between(t,{start_time},{end_time}),iw/2*(1-(t-{start_time})/({end_time}-{start_time})),iw/2):0'
+        else:
+            vf = f'crop=iw:ih/2:0:if(between(t,{start_time},{end_time}),ih/2*(t-{start_time})/({end_time}-{start_time}),0)'
+    else:
+        return {'success': False, 'error': f'Unknown animation type: {anim_type}'}
+    
+    cmd = [
+        'ffmpeg', '-i', main_path,
+        '-vf', vf,
+        '-c:v', 'libx264',
+        '-c:a', 'copy',
+        '-crf', '23',
+        '-preset', 'medium',
+        '-movflags', '+faststart',
+        '-pix_fmt', 'yuv420p',
+        '-y', output_path
+    ]
+    
+    success, message = run_ffmpeg_command(cmd, timeout=300)
+    
+    if success:
+        return {'success': True, 'output_file': output_filename, 'message': f'{anim_type} animation applied'}
+    else:
+        return {'success': False, 'error': f'Animation failed: {message}'}
+
+def execute_overlay_command(prompt, main_path, files, timestamp):
+    """Execute overlay command: overlay type=text|image|video content="X" x=Y y=Z duration=W position=top|bottom|center-left|right|center"""
+    params = parse_parameters(prompt)
+    
+    overlay_type = params.get('type', 'text')
+    content = params.get('content', 'Sample Text')
+    x_pos = params.get('x', 10)
+    y_pos = params.get('y', 10)
+    duration = params.get('duration', 0)  # 0 = entire video
+    position = params.get('position', 'bottom-center')
+    font_size = params.get('fontsize', 24)
+    font_color = params.get('fontcolor', 'white')
+    opacity = params.get('opacity', 1.0)
+    
+    output_filename = f'prompt_overlay_{timestamp}.mp4'
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+    
+    if overlay_type == 'text':
+        # Position mapping
+        pos_map = {
+            'top-left': '10:10',
+            'top-center': '(w-text_w)/2:10',
+            'top-right': 'w-text_w-10:10',
+            'center-left': '10:(h-text_h)/2',
+            'center': '(w-text_w)/2:(h-text_h)/2',
+            'center-right': 'w-text_w-10:(h-text_h)/2',
+            'bottom-left': '10:h-text_h-10',
+            'bottom-center': '(w-text_w)/2:h-text_h-10',
+            'bottom-right': 'w-text_w-10:h-text_h-10'
+        }
+        
+        text_pos = pos_map.get(position, f'{x_pos}:{y_pos}')
+        
+        # Build text filter with enhanced options
+        text_filter = f'drawtext=text=\'{content}\':fontsize={font_size}:fontcolor={font_color}:x={text_pos}'
+        
+        # Add background box for better readability
+        text_filter += ':box=1:boxcolor=black@0.5:boxborderw=5'
+        
+        # Add duration if specified
+        if duration > 0:
+            text_filter += f':enable=\'between(t,0,{duration})\''
+        
+        cmd = [
+            'ffmpeg', '-i', main_path,
+            '-vf', text_filter,
+            '-c:v', 'libx264',
+            '-c:a', 'copy',
+            '-crf', '23',
+            '-preset', 'medium',
+            '-movflags', '+faststart',
+            '-pix_fmt', 'yuv420p',
+            '-y', output_path
+        ]
+        
+        success, message = run_ffmpeg_command(cmd, timeout=300)
+        
+        if success:
+            return {'success': True, 'output_file': output_filename, 'message': f'Text overlay "{content}" added'}
+        else:
+            return {'success': False, 'error': f'Text overlay failed: {message}'}
+    
+    elif overlay_type in ['image', 'video']:
+        # Check if auxiliary files are provided
+        if 'files[]' not in files:
+            return {'success': False, 'error': f'{overlay_type.title()} overlay requires an auxiliary {overlay_type} file. Please upload a {overlay_type} in the auxiliary files section.'}
+        
+        aux_files = files.getlist('files[]')
+        if not aux_files:
+            return {'success': False, 'error': f'No auxiliary {overlay_type} file provided for overlay.'}
+        
+        # Use the first auxiliary file as overlay
+        overlay_file = aux_files[0]
+        if not overlay_file or not overlay_file.filename:
+            return {'success': False, 'error': f'Invalid {overlay_type} file for overlay.'}
+        
+        # Save overlay file
+        overlay_filename = secure_filename(overlay_file.filename)
+        overlay_input_filename = f"{timestamp}_overlay_{overlay_filename}"
+        overlay_path = os.path.join(app.config['UPLOAD_FOLDER'], overlay_input_filename)
+        
+        save_success, save_message = save_file_safely(overlay_file, overlay_path)
+        if not save_success:
+            return {'success': False, 'error': f'Failed to save overlay {overlay_type}: {save_message}'}
+        
+        # Validate the overlay file if it's an image
+        if overlay_type == 'image':
+            validate_success, validate_message = validate_image_file(overlay_path)
+            if not validate_success:
+                if os.path.exists(overlay_path):
+                    os.remove(overlay_path)
+                return {'success': False, 'error': f'Invalid image file: {validate_message}'}
+        
+        try:
+            # Get additional parameters
+            width = params.get('width')
+            height = params.get('height')
+            start_time = params.get('start', 0)
+            
+            print(f"Overlay parameters: type={overlay_type}, position={position}, width={width}, height={height}, opacity={opacity}, duration={duration}, start={start_time}")
+            
+            # Position mapping for overlays
+            if position != 'custom':
+                pos_map = {
+                    'top-left': '10:10',
+                    'top-center': '(main_w-overlay_w)/2:10',
+                    'top-right': 'main_w-overlay_w-10:10',
+                    'center-left': '10:(main_h-overlay_h)/2',
+                    'center': '(main_w-overlay_w)/2:(main_h-overlay_h)/2',
+                    'center-right': 'main_w-overlay_w-10:(main_h-overlay_h)/2',
+                    'bottom-left': '10:main_h-overlay_h-10',
+                    'bottom-center': '(main_w-overlay_w)/2:main_h-overlay_h-10',
+                    'bottom-right': 'main_w-overlay_w-10:main_h-overlay_h-10'
+                }
+                overlay_pos = pos_map.get(position, f'{x_pos}:{y_pos}')
+            else:
+                overlay_pos = f'{x_pos}:{y_pos}'
+            
+            # Build optimized overlay filter
+            filter_parts = []
+            
+            # Start with the overlay input
+            overlay_input = '[1:v]'
+            
+            # Add scaling if specified
+            if width or height:
+                if width and height:
+                    overlay_input += f'scale={width}:{height},'
+                elif width:
+                    overlay_input += f'scale={width}:-1,'
+                elif height:
+                    overlay_input += f'scale=-1:{height},'
+            
+            # For images, add loop to make them last the duration (simplified)
+            if overlay_type == 'image':
+                overlay_input += 'loop=loop=-1:size=1,'
+            
+            # Add opacity if not 1.0 (simplified)
+            if opacity != 1.0:
+                overlay_input += f'format=rgba,colorchannelmixer=aa={opacity},'
+            
+            # Remove trailing comma
+            if overlay_input.endswith(','):
+                overlay_input = overlay_input[:-1]
+            
+            overlay_input += '[ovr]'
+            
+            # Build the overlay command
+            overlay_cmd = f'[0:v][ovr]overlay={overlay_pos}'
+            
+            # Add duration control if specified
+            if duration > 0:
+                overlay_cmd += f':enable=\'between(t,{start_time},{start_time + duration})\''
+            
+            overlay_cmd += '[out]'
+            
+            # Combine the filter
+            overlay_filter = f'{overlay_input};{overlay_cmd}'
+            
+            print(f"Overlay filter: {overlay_filter}")  # Debug output
+            
+            cmd = [
+                'ffmpeg', '-i', main_path, '-i', overlay_path,
+                '-filter_complex', overlay_filter,
+                '-map', '[out]', '-map', '0:a?',
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-crf', '23',
+                '-preset', 'fast',  # Use faster preset for overlay processing
+                '-movflags', '+faststart',
+                '-pix_fmt', 'yuv420p',
+                '-y', output_path
+            ]
+            
+            print(f"Running overlay command: {' '.join(cmd)}")
+            success, message = run_ffmpeg_command(cmd, timeout=600)  # Increase timeout to 10 minutes
+            
+            # If the complex filter fails, try a simpler approach for images
+            if not success and overlay_type == 'image':
+                print(f"Complex overlay failed, trying simple approach: {message}")
+                
+                # Simple overlay without loop (for shorter videos or when duration is specified)
+                simple_filter = f'[1:v]scale=iw:ih[ovr];[0:v][ovr]overlay={overlay_pos}[out]'
+                
+                simple_cmd = [
+                    'ffmpeg', '-i', main_path, '-i', overlay_path,
+                    '-filter_complex', simple_filter,
+                    '-map', '[out]', '-map', '0:a?',
+                    '-c:v', 'libx264',
+                    '-c:a', 'copy',  # Just copy audio to be faster
+                    '-crf', '28',  # Lower quality for faster processing
+                    '-preset', 'ultrafast',  # Fastest preset
+                    '-t', str(duration) if duration > 0 else '30',  # Limit duration
+                    '-y', output_path
+                ]
+                
+                print(f"Running simple overlay command: {' '.join(simple_cmd)}")
+                success, message = run_ffmpeg_command(simple_cmd, timeout=300)
+            
+            # Clean up overlay file
+            if os.path.exists(overlay_path):
+                os.remove(overlay_path)
+            
+            if success:
+                return {'success': True, 'output_file': output_filename, 'message': f'{overlay_type.title()} overlay added at position {overlay_pos}'}
+            else:
+                return {'success': False, 'error': f'{overlay_type.title()} overlay failed: {message}'}
+                
+        except Exception as e:
+            # Clean up on error
+            if os.path.exists(overlay_path):
+                os.remove(overlay_path)
+            return {'success': False, 'error': f'{overlay_type.title()} overlay error: {str(e)}'}
+    
+    else:
+        return {'success': False, 'error': f'Overlay type "{overlay_type}" not supported. Use: text, image, video'}
+
+def execute_merge_command(prompt, files, timestamp):
+    """Execute merge_videos command: merge_videos transition=fade|dissolve|cut duration=X"""
+    params = parse_parameters(prompt)
+    
+    # Check if multiple files are provided
+    if 'files[]' not in files:
+        return {
+            'success': False, 
+            'error': 'Merge command requires multiple files. Please upload a main video and select auxiliary videos.',
+            'suggestion': 'Upload a main video file and select additional videos in the "Auxiliary Video Files" section.'
+        }
+    
+    file_list = files.getlist('files[]')
+    if len(file_list) < 2:
+        return {
+            'success': False, 
+            'error': 'Merge command requires at least 2 video files.',
+            'suggestion': 'Upload at least 2 video files to merge them together.'
+        }
+    
+    transition_type = params.get('transition', 'cut')
+    duration = params.get('duration', 1.0)
+    
+    print(f"Merging {len(file_list)} videos with {transition_type} transition...")
+    
+    # Save uploaded files with validation
+    input_paths = []
+    try:
+        for i, file in enumerate(file_list):
+            if file and file.filename:
+                filename = secure_filename(file.filename)
+                input_filename = f"merge_{timestamp}_{i}_{filename}"
+                input_path = os.path.join(app.config['UPLOAD_FOLDER'], input_filename)
+                
+                print(f"Processing file {i+1}: {filename} -> {input_filename}")
+                
+                # Debug: Check file object before saving
+                if hasattr(file, 'content_length'):
+                    print(f"File {i+1} content length: {file.content_length}")
+                
+                # Save file safely
+                save_success, save_message = save_file_safely(file, input_path)
+                if not save_success:
+                    print(f"Save failed for file {i+1}: {save_message}")
+                    return {'success': False, 'error': f'Failed to save video file {i+1}: {save_message}'}
+                
+                # Validate file exists and has content
+                if not os.path.exists(input_path):
+                    return {'success': False, 'error': f'Video file {i+1} was not saved to disk'}
+                
+                file_size = os.path.getsize(input_path)
+                if file_size == 0:
+                    return {'success': False, 'error': f'Video file {i+1} is empty after saving (0 bytes)'}
+                
+                print(f"File {i+1} saved successfully: {file_size} bytes")
+                
+                # Quick FFmpeg validation to ensure file is readable
+                validate_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', input_path]
+                try:
+                    validate_result = subprocess.run(validate_cmd, capture_output=True, text=True, timeout=15)
+                    if validate_result.returncode != 0:
+                        print(f"File validation failed for {input_path}: {validate_result.stderr}")
+                        # Try to get more detailed error info
+                        detailed_cmd = ['ffprobe', '-v', 'error', input_path]
+                        detailed_result = subprocess.run(detailed_cmd, capture_output=True, text=True, timeout=10)
+                        error_detail = detailed_result.stderr if detailed_result.stderr else "Unknown validation error"
+                        return {'success': False, 'error': f'Video file {i+1} is corrupted or invalid format: {error_detail}'}
+                except subprocess.TimeoutExpired:
+                    return {'success': False, 'error': f'Video file {i+1} validation timeout - file may be too large or corrupted'}
+                except Exception as e:
+                    return {'success': False, 'error': f'Video file {i+1} validation error: {str(e)}'}
+                
+                input_paths.append(input_path)
+                print(f"Successfully saved and validated video {i+1}: {input_filename} ({file_size} bytes)")
+            else:
+                print(f"Skipping invalid file {i+1}: {file}")
+                return {'success': False, 'error': f'Video file {i+1} is invalid or has no filename'}
+        
+        if len(input_paths) < 2:
+            return {'success': False, 'error': 'At least 2 valid video files are required for merging'}
+        
+        # Generate output filename
+        output_filename = f'prompt_merged_{timestamp}.mp4'
+        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+        
+        print(f"Processing merge with transition type: {transition_type}")
+        
+        # Use the existing merge logic with transitions
+        if transition_type == 'cut':
+            # Simple concatenation
+            print("Using simple concatenation (cut transition)")
+            success, message = merge_videos_simple(input_paths, output_path, timestamp)
+        else:
+            # Merge with transitions
+            print(f"Using transition merge with {transition_type} transition")
+            success, message = merge_videos_with_transition(input_paths, output_path, transition_type, duration, timestamp)
+        
+        # Clean up input files
+        for path in input_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        
+        if success:
+            return {
+                'success': True, 
+                'output_file': output_filename,
+                'message': f'Successfully merged {len(input_paths)} videos with {transition_type} transition'
+            }
+        else:
+            return {'success': False, 'error': f'Merge failed: {message}'}
+            
+    except Exception as e:
+        # Clean up files on error
+        for path in input_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        return {'success': False, 'error': f'Merge error: {str(e)}'}
+        
+        print(f"Merging {len(input_paths)} videos with {transition_type} transition...")
+        
+        # Generate output filename
+        output_filename = f'prompt_merge_{timestamp}.mp4'
+        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+        
+        # First normalize all videos to same format
+        normalized_paths = []
+        for i, input_path in enumerate(input_paths):
+            norm_filename = f"merge_norm_{timestamp}_{i}.mp4"
+            norm_path = os.path.join(app.config['UPLOAD_FOLDER'], norm_filename)
+            
+            # Normalize video to consistent format
+            norm_cmd = [
+                'ffmpeg', '-i', input_path,
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
+                '-r', '30',
+                '-ar', '44100',
+                '-ac', '2',
+                '-crf', '23',
+                '-preset', 'medium',
+                '-pix_fmt', 'yuv420p',
+                '-y', norm_path
+            ]
+            
+            success, message = run_ffmpeg_command(norm_cmd, timeout=300)
+            if not success:
+                # Clean up and return error
+                for path in input_paths + normalized_paths:
+                    if os.path.exists(path):
+                        os.remove(path)
+                return {'success': False, 'error': f'Failed to normalize video {i+1}: {message}'}
+            
+            normalized_paths.append(norm_path)
+        
+        # Apply merge with transition
+        if transition_type == 'cut':
+            # Simple concatenation
+            concat_file = os.path.join(app.config['UPLOAD_FOLDER'], f'merge_concat_{timestamp}.txt')
+            
+            with open(concat_file, 'w', encoding='utf-8') as f:
+                for path in normalized_paths:
+                    normalized_path = path.replace('\\', '/')
+                    f.write(f"file '{normalized_path}'\n")
+            
+            merge_cmd = [
+                'ffmpeg', '-f', 'concat', '-safe', '0', '-i', concat_file,
+                '-c', 'copy',
+                '-y', output_path
+            ]
+            
+            success, message = run_ffmpeg_command(merge_cmd, timeout=600)
+            
+            if os.path.exists(concat_file):
+                os.remove(concat_file)
+                
+        elif transition_type in ['fade', 'dissolve']:
+            if len(normalized_paths) == 2:
+                # Simple crossfade for 2 videos
+                fade_cmd = [
+                    'ffmpeg', '-i', normalized_paths[0], '-i', normalized_paths[1],
+                    '-filter_complex',
+                    f'[0:v][1:v]xfade=transition=fade:duration={duration}:offset=5[v];'
+                    f'[0:a][1:a]acrossfade=d={duration}[a]',
+                    '-map', '[v]', '-map', '[a]',
+                    '-c:v', 'libx264', '-c:a', 'aac',
+                    '-crf', '23', '-preset', 'medium',
+                    '-movflags', '+faststart',
+                    '-pix_fmt', 'yuv420p',
+                    '-y', output_path
+                ]
+                
+                success, message = run_ffmpeg_command(fade_cmd, timeout=600)
+            else:
+                # Multiple videos - use concat with fade effects
+                concat_file = os.path.join(app.config['UPLOAD_FOLDER'], f'merge_fade_{timestamp}.txt')
+                
+                with open(concat_file, 'w', encoding='utf-8') as f:
+                    for path in normalized_paths:
+                        normalized_path = path.replace('\\', '/')
+                        f.write(f"file '{normalized_path}'\n")
+                
+                fade_cmd = [
+                    'ffmpeg', '-f', 'concat', '-safe', '0', '-i', concat_file,
+                    '-vf', f'fade=in:0:{int(duration*30)},fade=out:st={max(0, 30-duration)}:d={duration}',
+                    '-af', f'afade=in:st=0:d={duration},afade=out:st={max(0, 30-duration)}:d={duration}',
+                    '-c:v', 'libx264', '-c:a', 'aac',
+                    '-crf', '23', '-preset', 'medium',
+                    '-movflags', '+faststart',
+                    '-pix_fmt', 'yuv420p',
+                    '-y', output_path
+                ]
+                
+                success, message = run_ffmpeg_command(fade_cmd, timeout=600)
+                
+                if os.path.exists(concat_file):
+                    os.remove(concat_file)
+        else:
+            success = False
+            message = f"Unsupported transition type: {transition_type}"
+        
+        # Clean up temporary files
+        for path in input_paths + normalized_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        
+        if success:
+            return {
+                'success': True, 
+                'output_file': output_filename, 
+                'message': f'Successfully merged {len(input_paths)} videos with {transition_type} transition'
+            }
+        else:
+            return {'success': False, 'error': f'Merge failed: {message}'}
+            
+    except Exception as e:
+        # Clean up files on error
+        for path in input_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        return {'success': False, 'error': f'Merge error: {str(e)}'}
+
+def save_file_safely(file, file_path):
+    """Save uploaded file safely with integrity checks"""
+    try:
+        # Check if file object is valid
+        if not file or not hasattr(file, 'save'):
+            return False, "Invalid file object"
+        
+        # Check if file has content
+        if not file.filename:
+            return False, "No filename provided"
+        
+        # Reset file pointer to beginning (important for multiple reads)
+        file.seek(0)
+        
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        
+        # Save the file with explicit flushing
+        try:
+            file.save(file_path)
+            
+            # Force file system sync
+            if os.path.exists(file_path):
+                with open(file_path, 'r+b') as f:
+                    f.flush()
+                    os.fsync(f.fileno())
+            
+        except Exception as save_error:
+            return False, f"File save failed: {str(save_error)}"
+        
+        # Wait for file system to fully sync
+        time.sleep(2.0)
+        
+        # Multiple verification attempts
+        for attempt in range(3):
+            if os.path.exists(file_path):
+                file_size = os.path.getsize(file_path)
+                if file_size > 0:
+                    print(f"File saved successfully: {os.path.basename(file_path)} ({file_size} bytes)")
+                    return True, "File saved successfully"
+            
+            # Wait a bit more and try again
+            time.sleep(1.0)
+        
+        # If we get here, file save failed
+        if os.path.exists(file_path):
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                os.remove(file_path)  # Remove empty file
+                return False, "File is empty after saving - upload may have been interrupted"
+            else:
+                return True, "File saved successfully"
+        else:
+            return False, "File was not saved to disk"
+        
+    except Exception as e:
+        # Clean up on error
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except:
+                pass
+        return False, f"File save error: {str(e)}"
+
+def validate_and_repair_video_file(input_path, file_index):
+    """Validate and attempt to repair a video file if corrupted"""
+    try:
+        # Check file exists and has content
+        if not os.path.exists(input_path) or os.path.getsize(input_path) == 0:
+            return False, f'Video file {file_index} is empty or missing'
+        
+        # Enhanced FFmpeg validation
+        validate_cmd = ['ffprobe', '-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', input_path]
+        validate_result = subprocess.run(validate_cmd, capture_output=True, text=True, timeout=15)
+        
+        if validate_result.returncode != 0:
+            print(f"File validation failed for {input_path}")
+            print(f"FFprobe stderr: {validate_result.stderr}")
+            
+            # Try to repair the file using FFmpeg
+            print(f"Attempting to repair video file {file_index}...")
+            repaired_path = input_path.replace('.mp4', '_repaired.mp4')
+            repair_cmd = [
+                'ffmpeg', '-err_detect', 'ignore_err', '-i', input_path,
+                '-c', 'copy', '-y', repaired_path
+            ]
+            
+            repair_result = subprocess.run(repair_cmd, capture_output=True, text=True, timeout=30)
+            if repair_result.returncode == 0 and os.path.exists(repaired_path):
+                # Replace original with repaired version
+                os.remove(input_path)
+                os.rename(repaired_path, input_path)
+                print(f"Successfully repaired video file {file_index}")
+                return True, f"Video file {file_index} repaired successfully"
+            else:
+                return False, f'Video file {file_index} is corrupted and cannot be repaired. Please try uploading again.'
+        else:
+            # Parse the validation result to get file info
+            try:
+                import json
+                file_info = json.loads(validate_result.stdout)
+                duration = float(file_info.get('format', {}).get('duration', 0))
+                print(f"Video {file_index} validated successfully - Duration: {duration:.2f}s")
+                return True, f"Video file {file_index} is valid"
+            except:
+                print(f"Video {file_index} validated successfully")
+                return True, f"Video file {file_index} is valid"
+                
+    except subprocess.TimeoutExpired:
+        return False, f'Video file {file_index} validation timeout - file may be too large or corrupted'
+    except Exception as e:
+        return False, f'Video file {file_index} validation error: {str(e)}'
+
+def merge_videos_simple(input_paths, output_path, timestamp):
+    """Simple video merging without transitions"""
+    try:
+        print(f"Starting simple merge for {len(input_paths)} videos...")
+        
+        # Validate all input files first
+        for i, input_path in enumerate(input_paths):
+            if not os.path.exists(input_path):
+                return False, f'Input video {i+1} not found: {input_path}'
+            
+            file_size = os.path.getsize(input_path)
+            if file_size == 0:
+                return False, f'Input video {i+1} is empty: {input_path}'
+            
+            print(f"Video {i+1}: {os.path.basename(input_path)} ({file_size} bytes)")
+        
+        # Create concat file for FFmpeg
+        concat_file = os.path.join(app.config['UPLOAD_FOLDER'], f'simple_concat_{timestamp}.txt')
+        
+        with open(concat_file, 'w', encoding='utf-8') as f:
+            for i, path in enumerate(input_paths):
+                normalized_path = path.replace('\\', '/')
+                f.write(f"file '{normalized_path}'\n")
+                print(f"Added to concat list: {normalized_path}")
+        
+        # Debug: Print concat file contents
+        print("Concat file contents:")
+        with open(concat_file, 'r', encoding='utf-8') as f:
+            print(f.read())
+        
+        # Use re-encoding for compatibility
+        cmd = [
+            'ffmpeg', '-f', 'concat', '-safe', '0', '-i', concat_file,
+            '-c:v', 'libx264',
+            '-c:a', 'aac',
+            '-crf', '23',
+            '-preset', 'medium',
+            '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
+            '-r', '30',
+            '-ar', '44100',
+            '-ac', '2',
+            '-movflags', '+faststart',
+            '-pix_fmt', 'yuv420p',
+            '-y', output_path
+        ]
+        
+        print(f"Running FFmpeg command: {' '.join(cmd)}")
+        success, message = run_ffmpeg_command(cmd, timeout=600)
+        
+        # Clean up concat file
+        if os.path.exists(concat_file):
+            os.remove(concat_file)
+        
+        if success:
+            print(f"Simple merge completed successfully. Output: {output_path}")
+        else:
+            print(f"Simple merge failed: {message}")
+        
+        return success, message
+        
+    except Exception as e:
+        print(f"Exception in simple merge: {str(e)}")
+        return False, f"Simple merge error: {str(e)}"
+
+def merge_videos_with_transition(input_paths, output_path, transition_type, duration, timestamp):
+    """Merge videos with transitions between them"""
+    try:
+        print(f"Starting merge with transition for {len(input_paths)} videos...")
+        
+        # Validate all input files first
+        for i, input_path in enumerate(input_paths):
+            if not os.path.exists(input_path):
+                return False, f'Input video {i+1} not found: {input_path}'
+            
+            file_size = os.path.getsize(input_path)
+            if file_size == 0:
+                return False, f'Input video {i+1} is empty: {input_path}'
+            
+            print(f"Video {i+1}: {os.path.basename(input_path)} ({file_size} bytes)")
+        
+        # First normalize all videos
+        normalized_paths = []
+        
+        for i, input_path in enumerate(input_paths):
+            norm_filename = f"merge_norm_{timestamp}_{i}.mp4"
+            norm_path = os.path.join(app.config['UPLOAD_FOLDER'], norm_filename)
+            
+            print(f"Normalizing video {i+1}...")
+            
+            # Normalize video to consistent format
+            norm_cmd = [
+                'ffmpeg', '-i', input_path,
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
+                '-r', '30',
+                '-ar', '44100',
+                '-ac', '2',
+                '-crf', '23',
+                '-preset', 'medium',
+                '-pix_fmt', 'yuv420p',
+                '-y', norm_path
+            ]
+            
+            success, message = run_ffmpeg_command(norm_cmd, timeout=600)
+            if not success:
+                print(f"Normalization failed for video {i+1}: {message}")
+                # Clean up and return error
+                for path in normalized_paths:
+                    if os.path.exists(path):
+                        os.remove(path)
+                return False, f'Failed to normalize video {i+1}: {message}'
+            
+            # Verify normalized file was created
+            if not os.path.exists(norm_path) or os.path.getsize(norm_path) == 0:
+                return False, f'Normalized video {i+1} was not created properly'
+            
+            normalized_paths.append(norm_path)
+            print(f"Successfully normalized video {i+1}")
+        
+        # Apply transitions based on type
+        if transition_type in ['fade', 'dissolve'] and len(normalized_paths) == 2:
+            # Simple crossfade for 2 videos
+            transition_cmd = [
+                'ffmpeg', '-i', normalized_paths[0], '-i', normalized_paths[1],
+                '-filter_complex',
+                f'[0:v][1:v]xfade=transition=fade:duration={duration}:offset=5[v];'
+                f'[0:a][1:a]acrossfade=d={duration}[a]',
+                '-map', '[v]', '-map', '[a]',
+                '-c:v', 'libx264', '-c:a', 'aac',
+                '-crf', '23', '-preset', 'medium',
+                '-movflags', '+faststart',
+                '-pix_fmt', 'yuv420p',
+                '-y', output_path
+            ]
+            
+            success, message = run_ffmpeg_command(transition_cmd, timeout=600)
+        else:
+            # For multiple videos or other transition types, use simple concat
+            concat_file = os.path.join(app.config['UPLOAD_FOLDER'], f'trans_concat_{timestamp}.txt')
+            
+            with open(concat_file, 'w', encoding='utf-8') as f:
+                for path in normalized_paths:
+                    normalized_path = path.replace('\\', '/')
+                    f.write(f"file '{normalized_path}'\n")
+            
+            concat_cmd = [
+                'ffmpeg', '-f', 'concat', '-safe', '0', '-i', concat_file,
+                '-c', 'copy',
+                '-y', output_path
+            ]
+            
+            success, message = run_ffmpeg_command(concat_cmd, timeout=300)
+            
+            if os.path.exists(concat_file):
+                os.remove(concat_file)
+        
+        # Clean up normalized files
+        for path in normalized_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        
+        return success, message
+        
+    except Exception as e:
+        return False, f"Transition merge error: {str(e)}"
+
+def execute_transition_command(prompt, files, timestamp):
+    """Execute transition command: transition type=fade|dissolve|wipe|cut duration=X"""
+    params = parse_parameters(prompt)
+    
+    # Check if multiple files are provided
+    if 'files[]' not in files:
+        return {
+            'success': False, 
+            'error': 'Transition command requires multiple files. Please upload a main video and select auxiliary videos.',
+            'suggestion': 'Upload a main video file and select additional videos in the "Auxiliary Video Files" section.'
+        }
+    
+    file_list = files.getlist('files[]')
+    if len(file_list) < 2:
+        return {
+            'success': False, 
+            'error': 'Transition command requires at least 2 video files.',
+            'suggestion': 'Please select at least one auxiliary video file in addition to the main video.'
+        }
+    
+    transition_type = params.get('type', 'fade')
+    duration = params.get('duration', 1.0)
+    
+    # Save uploaded files with validation
+    input_paths = []
+    try:
+        for i, file in enumerate(file_list):
+            if file and file.filename:
+                filename = secure_filename(file.filename)
+                input_filename = f"trans_{timestamp}_{i}_{filename}"
+                input_path = os.path.join(app.config['UPLOAD_FOLDER'], input_filename)
+                
+                # Save file safely
+                save_success, save_message = save_file_safely(file, input_path)
+                if not save_success:
+                    return {'success': False, 'error': f'Failed to save video file {i+1}: {save_message}'}
+                
+                # Validate file exists and has content
+                if not os.path.exists(input_path) or os.path.getsize(input_path) == 0:
+                    return {'success': False, 'error': f'Failed to save video file {i+1} properly'}
+                
+                # Quick FFmpeg validation to ensure file is readable
+                validate_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', input_path]
+                try:
+                    validate_result = subprocess.run(validate_cmd, capture_output=True, text=True, timeout=10)
+                    if validate_result.returncode != 0:
+                        print(f"File validation failed for {input_path}: {validate_result.stderr}")
+                        return {'success': False, 'error': f'Video file {i+1} is corrupted or invalid format'}
+                except subprocess.TimeoutExpired:
+                    return {'success': False, 'error': f'Video file {i+1} validation timeout'}
+                except Exception as e:
+                    return {'success': False, 'error': f'Video file {i+1} validation error: {str(e)}'}
+                
+                input_paths.append(input_path)
+                print(f"Successfully saved and validated video {i+1}: {input_filename}")
+        
+        if len(input_paths) < 2:
+            return {'success': False, 'error': 'At least 2 valid video files are required for transitions'}
+        
+        print(f"Applying {transition_type} transitions between {len(input_paths)} videos...")
+        
+        # Generate output filename
+        output_filename = f'prompt_transition_{timestamp}.mp4'
+        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+        
+        # First normalize all videos to same format to avoid timebase issues
+        normalized_paths = []
+        for i, input_path in enumerate(input_paths):
+            norm_filename = f"trans_norm_{timestamp}_{i}.mp4"
+            norm_path = os.path.join(app.config['UPLOAD_FOLDER'], norm_filename)
+            
+            # Normalize video to consistent format
+            norm_cmd = [
+                'ffmpeg', '-i', input_path,
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
+                '-r', '30',  # Force consistent frame rate
+                '-ar', '44100',  # Force consistent audio sample rate
+                '-ac', '2',  # Force stereo
+                '-crf', '23',
+                '-preset', 'medium',
+                '-pix_fmt', 'yuv420p',
+                '-y', norm_path
+            ]
+            
+            success, message = run_ffmpeg_command(norm_cmd, timeout=300)
+            if not success:
+                # Clean up and return error
+                for path in input_paths + normalized_paths:
+                    if os.path.exists(path):
+                        os.remove(path)
+                return {'success': False, 'error': f'Failed to normalize video {i+1}: {message}'}
+            
+            normalized_paths.append(norm_path)
+        
+        # Apply transitions based on type
+        success = False
+        message = ""
+        
+        if transition_type == 'fade':
+            if len(normalized_paths) == 2:
+                # Simple crossfade for 2 videos
+                fade_cmd = [
+                    'ffmpeg', '-i', normalized_paths[0], '-i', normalized_paths[1],
+                    '-filter_complex',
+                    f'[0:v][1:v]xfade=transition=fade:duration={duration}:offset=5[v];'
+                    f'[0:a][1:a]acrossfade=d={duration}[a]',
+                    '-map', '[v]', '-map', '[a]',
+                    '-c:v', 'libx264', '-c:a', 'aac',
+                    '-crf', '23', '-preset', 'medium',
+                    '-movflags', '+faststart',
+                    '-pix_fmt', 'yuv420p',
+                    '-y', output_path
+                ]
+                
+                success, message = run_ffmpeg_command(fade_cmd, timeout=600)
+            else:
+                # Multiple videos - use filter_complex for fade transitions
+                filter_inputs = []
+                for i, path in enumerate(normalized_paths):
+                    filter_inputs.extend(['-i', path])
+                
+                # Build filter complex for fade transitions
+                video_filters = []
+                audio_filters = []
+                
+                for i in range(len(normalized_paths)):
+                    if i == 0:
+                        # First video: fade out at end
+                        video_filters.append(f'[{i}:v]fade=out:st=5:d={duration}[v{i}]')
+                        audio_filters.append(f'[{i}:a]afade=out:st=5:d={duration}[a{i}]')
+                    elif i == len(normalized_paths) - 1:
+                        # Last video: fade in at start
+                        video_filters.append(f'[{i}:v]fade=in:st=0:d={duration}[v{i}]')
+                        audio_filters.append(f'[{i}:a]afade=in:st=0:d={duration}[a{i}]')
+                    else:
+                        # Middle videos: fade in and out
+                        video_filters.append(f'[{i}:v]fade=in:st=0:d={duration},fade=out:st=5:d={duration}[v{i}]')
+                        audio_filters.append(f'[{i}:a]afade=in:st=0:d={duration},afade=out:st=5:d={duration}[a{i}]')
+                
+                # Concatenate all processed streams
+                video_inputs = ''.join([f'[v{i}]' for i in range(len(normalized_paths))])
+                audio_inputs = ''.join([f'[a{i}]' for i in range(len(normalized_paths))])
+                
+                filter_complex = ';'.join(video_filters + audio_filters + [
+                    f'{video_inputs}concat=n={len(normalized_paths)}:v=1:a=0[outv]',
+                    f'{audio_inputs}concat=n={len(normalized_paths)}:v=0:a=1[outa]'
+                ])
+                
+                fade_cmd = [
+                    'ffmpeg'
+                ] + filter_inputs + [
+                    '-filter_complex', filter_complex,
+                    '-map', '[outv]', '-map', '[outa]',
+                    '-c:v', 'libx264', '-c:a', 'aac',
+                    '-crf', '23', '-preset', 'medium',
+                    '-movflags', '+faststart',
+                    '-pix_fmt', 'yuv420p',
+                    '-y', output_path
+                ]
+                
+                success, message = run_ffmpeg_command(fade_cmd, timeout=900)
+        
+        elif transition_type == 'dissolve':
+            if len(normalized_paths) == 2:
+                # Simple crossfade between two normalized videos
+                dissolve_cmd = [
+                    'ffmpeg', '-i', normalized_paths[0], '-i', normalized_paths[1],
+                    '-filter_complex',
+                    f'[0:v][1:v]xfade=transition=dissolve:duration={duration}:offset=5[v];'
+                    f'[0:a][1:a]acrossfade=d={duration}[a]',
+                    '-map', '[v]', '-map', '[a]',
+                    '-c:v', 'libx264', '-c:a', 'aac',
+                    '-crf', '23', '-preset', 'medium',
+                    '-movflags', '+faststart',
+                    '-pix_fmt', 'yuv420p',
+                    '-y', output_path
+                ]
+                
+                success, message = run_ffmpeg_command(dissolve_cmd, timeout=600)
+            else:
+                # For multiple videos, just concatenate (dissolve works best with 2 videos)
+                concat_file = os.path.join(app.config['UPLOAD_FOLDER'], f'trans_concat_{timestamp}.txt')
+                
+                with open(concat_file, 'w', encoding='utf-8') as f:
+                    for path in normalized_paths:
+                        normalized_path = path.replace('\\', '/')
+                        f.write(f"file '{normalized_path}'\n")
+                
+                dissolve_cmd = [
+                    'ffmpeg', '-f', 'concat', '-safe', '0', '-i', concat_file,
+                    '-c', 'copy',
+                    '-y', output_path
+                ]
+                
+                success, message = run_ffmpeg_command(dissolve_cmd, timeout=300)
+                
+                if os.path.exists(concat_file):
+                    os.remove(concat_file)
+        
+        # Clean up normalized files
+        for path in normalized_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        
+        # Clean up input files
+        for path in input_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        
+        if not success:
+            return {'success': False, 'error': f'Transition failed: {message}'}
+        
+        return {
+            'success': True,
+            'output_file': output_filename,
+            'message': f'Applied {transition_type} transitions using FFmpeg'
+        }
+        
+    except Exception as e:
+        print(f"Error in execute_transition_command: {str(e)}")
+        # Clean up files on error
+        for path in input_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        return {'success': False, 'error': f'Transition error: {str(e)}'}
 
 @login_manager.unauthorized_handler
 def unauthorized():
@@ -2145,9 +5372,10 @@ def search_dailymotion_clips():
 @app.route('/download-dailymotion-clip', methods=['POST'])
 @login_required
 def download_dailymotion_clip():
-    import time
     print(f"Debug - download_dailymotion_clip function called.")
+    """Download a Dailymotion clip using yt-dlp."""
     try:
+        # Check if user is authenticated
         if not current_user.is_authenticated:
             return jsonify({
                 'success': False,
@@ -2162,60 +5390,150 @@ def download_dailymotion_clip():
         video_id = data['video_id']
         print(f"Debug - Downloading Dailymotion video ID: {video_id} using yt-dlp")
 
+        # Generate output filename
         output_filename = f'dailymotion_{video_id}_{int(time.time())}.mp4'
         output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
 
+        # Configure yt-dlp options for Dailymotion
         ydl_opts = {
-            'format': 'best',
+            'format': 'best', # Let yt-dlp pick the best format
             'outtmpl': output_path,
-            'quiet': False,
-            'no_warnings': True,
+            'verbose': True,
+            'no_warnings': False,
             'ignoreerrors': True,
+            'quiet': False,
+            'no_color': True,
+            'extract_flat': False,
+            'force_generic_extractor': False,
             'nocheckcertificate': True,
+            'prefer_insecure': True,
             'geo_bypass': True,
-            'retries': 5,
-            'fragment_retries': 5,
+            'socket_timeout': 60, # Increased socket timeout
+            'retries': 10, # Increased retries for robustness
+            'fragment_retries': 10,
             'skip_unavailable_fragments': True,
+            'keepvideo': False,
+            'writedescription': False,
+            'writeinfojson': False,
+            'writesubtitles': False,
+            'writeautomaticsub': False,
+            'postprocessors': [],
             'merge_output_format': 'mp4',
             'progress_with_newline': True,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
         }
 
-        urls_to_try = [
-            f'https://www.dailymotion.com/video/{video_id}',
-            f'https://dailymotion.com/video/{video_id}',
-            f'https://www.dailymotion.com/embed/video/{video_id}'
-        ]
-
-        last_error = None
-        for url in urls_to_try:
-            for attempt in range(5):  # Try each URL up to 3 times
+        try:
+            print(f"Debug - Starting yt-dlp download to: {output_path}")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # First try to extract info to verify the video exists and is downloadable
                 try:
-                    print(f"Debug - Attempting download from: {url}, attempt {attempt+1}")
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([url])
-                    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                        print(f"Debug - Successfully downloaded Dailymotion video from: {url}")
-                        return jsonify({'success': True, 'filename': output_filename})
-                    else:
-                        print(f"Debug - File not found or empty after download attempt from: {url}")
-                        if os.path.exists(output_path):
-                            os.remove(output_path)
-                except Exception as e:
-                    print(f"Debug - Download failed from {url} on attempt {attempt+1}: {repr(e)}")
-                    last_error = repr(e)
-                    if os.path.exists(output_path):
-                        os.remove(output_path)
-                    time.sleep(3)  # Wait 2 seconds before retrying
-                    continue
+                    # Try with different URL formats
+                    urls_to_try = [
+                        f'https://www.dailymotion.com/video/{video_id}',
+                        f'https://dailymotion.com/video/{video_id}',
+                        f'https://www.dailymotion.com/embed/video/{video_id}'
+                    ]
 
-        return jsonify({'success': False, 'error': f'Video not found or unavailable. Last error: {last_error}'})
+                    info = None
+                    for url in urls_to_try:
+                        try:
+                            print(f"Debug - Trying to extract info from: {url}")
+                            info = ydl.extract_info(url, download=False)
+                            if info:
+                                print(f"Debug - Successfully extracted video info from: {url}")
+                                break
+                        except Exception as e:
+                            print(f"Debug - Failed to extract info from {url}: {str(e)}")
+                            continue
+
+                    if not info:
+                        print(f"Debug - Could not extract video info for {video_id} from any URL format")
+                        return jsonify({'success': False, 'error': 'Video not found or unavailable'})
+
+                except Exception as e:
+                    print(f"Debug - Error extracting video info for {video_id}: {type(e).__name__} - {str(e)}")
+                    return jsonify({'success': False, 'error': f'Error accessing video: {str(e)}'})
+
+                # Now try to download the video
+                try:
+                    print(f"Debug - Initiating download for {video_id}")
+                    # Use the first successful URL or the original one for download
+                    download_url = urls_to_try[0] if info else f'https://www.dailymotion.com/video/{video_id}'
+                    ydl.download([download_url])
+                    print(f"Debug - yt-dlp download process finished for {video_id}")
+                except Exception as e:
+                    print(f"Debug - Error during download for {video_id}: {type(e).__name__} - {str(e)}")
+                    if os.path.exists(output_path):
+                        try:
+                            os.remove(output_path)
+                        except: # nosec
+                            pass
+                    return jsonify({'success': False, 'error': f'Error downloading video: {str(e)}'})
+
+            # Verify the downloaded file
+            if not os.path.exists(output_path):
+                print(f"Debug - Output file not found after download at {output_path}")
+                return jsonify({'success': False, 'error': 'Failed to download video: Output file not created.'})
+
+            if os.path.getsize(output_path) == 0:
+                print(f"Debug - Downloaded file is empty at {output_path}")
+                os.remove(output_path)
+                return jsonify({'success': False, 'error': 'Downloaded video file is empty.'})
+
+            print(f"Debug - Successfully downloaded Dailymotion clip to {output_path}")
+
+            # --- NEW: Re-encode video for browser compatibility ---
+            try:
+                print(f"Debug - Loading downloaded Dailymotion clip for re-encoding: {output_path}")
+                clip = mp.VideoFileClip(output_path)
+
+                # Define temporary re-encoded path
+                reencoded_filename = f'reencoded_dailymotion_{int(time.time())}.mp4'
+                reencoded_path = os.path.join(app.config['OUTPUT_FOLDER'], reencoded_filename)
+
+                print(f"Debug - Re-encoding Dailymotion clip to: {reencoded_path}")
+                clip.write_videofile(
+                    reencoded_path,
+                    codec='libx264',
+                    audio_codec='aac',
+                    bitrate='3000k', # Adjust bitrate as needed for quality vs file size
+                    fps=clip.fps, # Preserve original FPS
+                    preset='medium', # Use a balanced preset for quality and speed
+                    threads=4,
+                    ffmpeg_params=[
+                        '-movflags', '+faststart', # For faster web playback
+                        '-pix_fmt', 'yuv420p', # Essential for broad browser compatibility
+                        '-crf', '23' # Constant Rate Factor: 23 is a good balance
+                    ]
+                )
+                clip.close()
+                os.remove(output_path) # Remove the original downloaded file
+                output_filename = reencoded_filename # Use the re-encoded filename for output
+                print(f"Debug - Successfully re-encoded Dailymotion clip to: {output_filename}")
+            except Exception as e:
+                print(f"Debug - Error during Dailymotion re-encoding: {str(e)}")
+                if os.path.exists(output_path): os.remove(output_path) # Clean up original if re-encoding fails
+                return jsonify({'success': False, 'error': f'Error re-encoding video for browser: {str(e)}'})
+            # --- END NEW RE-ENCODE ---
+
+            return jsonify({
+                'success': True,
+                'filename': output_filename # Return the re-encoded filename
+            })
+
+        except Exception as e:
+            print(f"Debug - yt-dlp execution error for {video_id}: {str(e)}")
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except: # nosec
+                    pass
+            return jsonify({'success': False, 'error': f'Error processing download: {str(e)}'})
 
     except Exception as e:
         print(f"Debug - General error in download_dailymotion_clip: {str(e)}")
         return jsonify({'success': False, 'error': f'Unexpected error: {str(e)}'})
+
 @app.route('/add-dailymotion-to-video', methods=['POST'])
 @login_required
 def add_dailymotion_to_video():
@@ -2239,33 +5557,22 @@ def add_dailymotion_to_video():
         video_file.save(temp_video_path)
         
         try:
-            # Load both videos
+            # Load both videos with high quality settings
             main_video = mp.VideoFileClip(temp_video_path, audio=True)
             dailymotion_video = mp.VideoFileClip(dailymotion_path, audio=True)
             
-            # Use the highest resolution and fps among both videos
+            # Ensure both videos have the same resolution (use the higher resolution)
             target_width = max(main_video.w, dailymotion_video.w)
             target_height = max(main_video.h, dailymotion_video.h)
-            target_width -= target_width % 2
-            target_height -= target_height % 2
-            target_fps = max(main_video.fps, dailymotion_video.fps)
-
-            # Only resize if needed
+            
+            # Resize videos if needed while maintaining aspect ratio
             if main_video.w != target_width or main_video.h != target_height:
-                main_video_resized = main_video.resize(newsize=(target_width, target_height))
-            else:
-                main_video_resized = main_video
-
+                main_video = main_video.resize(width=target_width, height=target_height)
             if dailymotion_video.w != target_width or dailymotion_video.h != target_height:
-                dailymotion_video_resized = dailymotion_video.resize(newsize=(target_width, target_height))
-            else:
-                dailymotion_video_resized = dailymotion_video
-
+                dailymotion_video = dailymotion_video.resize(width=target_width, height=target_height)
+            
             # Concatenate videos
-            final_video = mp.concatenate_videoclips(
-                [main_video_resized, dailymotion_video_resized],
-                method="compose"
-            )
+            final_video = mp.concatenate_videoclips([main_video, dailymotion_video])
             
             # Generate output filename
             timestamp = int(time.time())
@@ -2277,28 +5584,24 @@ def add_dailymotion_to_video():
                 output_path,
                 codec='libx264',
                 audio_codec='aac',
-                bitrate='15000k',  # Even higher bitrate
-                fps=target_fps,
-                preset='slow',
-                threads=4,
+                bitrate='8000k',  # High bitrate for better quality
+                fps=30,  # Maintain high frame rate
+                preset='slow',  # Better compression quality
+                threads=4,  # Use multiple threads for faster processing
                 ffmpeg_params=[
-                    '-crf', '16',  # Lower CRF for better quality
-                    '-movflags', '+faststart',
-                    '-pix_fmt', 'yuv420p'
+                    '-crf', '18',  # Constant Rate Factor (lower = better quality, 18 is visually lossless)
+                    '-movflags', '+faststart',  # Enable fast start for web playback
+                    '-pix_fmt', 'yuv420p'  # Ensure compatibility with most players
                 ]
             )
             
             # Clean up
             final_video.close()
-            if main_video_resized != main_video:
-                main_video_resized.close()
-            if dailymotion_video_resized != dailymotion_video:
-                dailymotion_video_resized.close()
             main_video.close()
             dailymotion_video.close()
+            
+            # Remove temporary files
             cleanup_files([temp_video_path, dailymotion_path])
-            import gc
-            gc.collect()
             
             return jsonify({
                 'success': True,
@@ -2307,682 +5610,13 @@ def add_dailymotion_to_video():
             
         except Exception as e:
             print(f"Error in video processing: {str(e)}")
+            # Clean up in case of error
             cleanup_files([temp_video_path, dailymotion_path])
             return jsonify({'success': False, 'error': f'Error processing video: {str(e)}'})
             
     except Exception as e:
         print(f"Error in add_dailymotion_to_video: {str(e)}")
         return jsonify({'success': False, 'error': str(e)})
-
-
-process = psutil.Process(os.getpid())
-mem_info = process.memory_info()
-print(f"Memory usage: {mem_info.rss / (1024 * 1024):.2f} MB")
-
-
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['OUTPUT_FOLDER'] = 'outputs'
-app.config['ALLOWED_EXTENSIONS'] = {'mp4', 'mov', 'avi', 'mkv'}
-
-# Supported commands for error messages
-SUPPORTED_COMMANDS = [
-    'trim start=X end=Y',
-    'resize width=X height=Y',
-    'speed factor=X',
-    'extract_audio format=mp3|wav',
-    'color_grade brightness=X contrast=Y saturation=Z',
-    'color_grade preset=cinematic|vintage|warm|cool|noir|vibrant',
-    'speed_ramp start=X end=Y factor=Z',
-    'effect type=blur|glow|vignette|freeze_frame|motion_blur|sepia|negative|mirror|pixelate|edge_detection strength=X',
-    'animation type=zoom|pan|fade|bounce|rotate|slide start=X end=Y scale=Z angle=A direction=left|right|up|down',
-    'merge_videos files=file1.mp4,file2.mp4 transition=type duration=X',
-    'overlay type=text|image|video content="X" x=Y y=Z duration=W position=top|bottom|center-left|right|center',
-    'transition type=crossfade|slide|wipe|fade duration=X direction=left|right|up|down'
-]
-def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
-
-# Custom effect implementations
-def apply_glow(clip, intensity=0.5):
-    """Custom glow effect implementation"""
-    blurred = clip.fx(gaussian_blur, sigma=intensity*10)
-    return CompositeVideoClip([clip, blurred.set_opacity(intensity)])
-
-def apply_vignette(clip, strength=0.8):
-    """Custom vignette effect implementation"""
-    def vignette_filter(frame):
-        h, w = frame.shape[:2]
-        x = np.linspace(-1, 1, w)
-        y = np.linspace(-1, 1, h)
-        X, Y = np.meshgrid(x, y)
-        mask = 1 - np.sqrt(X**2 + Y**2) * strength
-        mask = np.clip(mask, 0, 1)
-        return (frame * mask[..., np.newaxis]).astype(frame.dtype)
-    return clip.fl_image(vignette_filter)
-
-@app.route('/process-prompt', methods=['POST'])
-@login_required
-def process_prompt():
-    try:
-        if 'file' not in request.files:
-            return jsonify({'success': False, 'error': 'No file uploaded'})
-        
-        file = request.files['file']
-        prompt = request.form.get('prompt', '').strip().lower()
-
-        # --- ADD THIS BLOCK FOR AUXILIARY FILES ---
-        if 'aux_file' in request.files:
-            aux_file = request.files['aux_file']
-            if aux_file and allowed_file(aux_file.filename):
-                aux_filename = secure_filename(aux_file.filename)
-                aux_path = os.path.join(app.config['UPLOAD_FOLDER'], aux_filename)
-                aux_file.save(aux_path)
-        
-        if not prompt:
-            return jsonify({'success': False, 'error': 'No prompt provided'})
-        if not allowed_file(file.filename):
-            return jsonify({'success': False, 'error': 'Invalid file type'})
-
-        # Command validation
-        is_color_grade = prompt.startswith('color_grade')
-        has_preset = any(x in prompt for x in ['cinematic','vintage','warm','cool','noir','vibrant'])
-        has_custom = any(x in prompt for x in ['brightness=','contrast=','saturation='])
-        
-        # Fixed validation logic
-        is_valid = any(prompt.startswith(cmd.split()[0]) for cmd in SUPPORTED_COMMANDS)
-        if not is_valid and not (is_color_grade and (has_preset or has_custom)):
-            return jsonify({
-                'success': False,
-                'error': f'Unknown command. Supported: {", ".join(SUPPORTED_COMMANDS)}'
-            })
-
-        os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-        filename = secure_filename(file.filename)
-        input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(input_path)
-        
-        result = handle_video_processing(input_path, prompt)
-        
-        try:
-            os.remove(input_path)
-        except:
-            pass
-            
-        return jsonify(result)
-
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-
-def handle_video_processing(input_path, prompt):
-    video = None
-    try:
-        video = VideoFileClip(input_path)
-        output_filename = None
-        processed_clip = video
-
-        # Trim Video
-        if prompt.startswith('trim'):
-            match = re.search(r'start=([\d.]+)\s*end=([\d.]+)', prompt)
-            if match:
-                start, end = float(match.group(1)), float(match.group(2))
-                processed_clip = video.subclip(start, end)
-                output_filename = f"trimmed_{int(time.time())}.mp4"
-
-        # Resize Video
-        elif prompt.startswith('resize'):
-            match = re.search(r'width=(\d+)\s*height=(\d+)', prompt)
-            if match:
-                width, height = int(match.group(1)), int(match.group(2))
-                processed_clip = video.resize((width, height))
-                output_filename = f"resized_{int(time.time())}.mp4"
-
-        # Change Speed
-        elif prompt.startswith('speed'):
-            match = re.search(r'factor=([\d.]+)', prompt)
-            if match:
-                factor = float(match.group(1))
-                processed_clip = video.fx(vfx.speedx, factor)
-                output_filename = f"speed_{factor}x_{int(time.time())}.mp4"
-
-        # Extract Audio
-        elif prompt.startswith('extract_audio'):
-            match = re.search(r'format=(mp3|wav)', prompt)
-            audio_format = match.group(1) if match else "mp3"
-            output_filename = f"audio_{int(time.time())}.{audio_format}"
-            output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
-            video.audio.write_audiofile(output_path)
-            return {'success': True, 'output_file': output_filename}
-
-        # Color Grading
-        elif prompt.startswith('color_grade'):
-            preset_match = re.search(r'color_grade\s+(\w+)', prompt)
-            custom_match = re.search(r'brightness=([\d.]+)\s*contrast=([\d.]+)\s*saturation=([\d.]+)', prompt)
-
-            COLOR_PRESETS = {
-                'cinematic': {'brightness': 0.9, 'contrast': 1.2, 'saturation': 1.1, 'temperature': -5},
-                'vintage': {'brightness': 0.85, 'contrast': 1.1, 'saturation': 0.8, 'temperature': 15},
-                'warm': {'brightness': 1.1, 'contrast': 1.0, 'saturation': 1.3, 'temperature': 20},
-                'cool': {'brightness': 0.95, 'contrast': 1.1, 'saturation': 0.7, 'temperature': -15},
-                'noir': {'brightness': 0.8, 'contrast': 1.3, 'saturation': 0.5, 'temperature': 0},
-                'vibrant': {'brightness': 1.1, 'contrast': 1.2, 'saturation': 1.4, 'temperature': 0}
-            }
-
-            def apply_color_adjustments(frame, brightness=1.0, contrast=1.0, saturation=1.0, temperature=0):
-                try:
-                    pil_img = Image.fromarray(frame)
-                    if brightness != 1.0:
-                        pil_img = ImageEnhance.Brightness(pil_img).enhance(brightness)
-                    if contrast != 1.0:
-                        pil_img = ImageEnhance.Contrast(pil_img).enhance(contrast)
-                    if saturation != 1.0:
-                        pil_img = ImageEnhance.Color(pil_img).enhance(saturation)
-                    if temperature != 0:
-                        r, g, b = pil_img.split()
-                        if temperature > 0:
-                            r = r.point(lambda i: min(255, i + temperature))
-                            b = b.point(lambda i: max(0, i - temperature//2))
-                        else:
-                            b = b.point(lambda i: min(255, i - temperature))
-                            r = r.point(lambda i: max(0, i + temperature//2))
-                        pil_img = Image.merge('RGB', (r, g, b))
-                    return np.array(pil_img)
-                except Exception as e:
-                    print(f"Frame processing error: {str(e)}")
-                    return frame
-
-            if preset_match and preset_match.group(1).lower() in COLOR_PRESETS:
-                preset_name = preset_match.group(1).lower()
-                params = COLOR_PRESETS[preset_name]
-                processed_clip = video.fl_image(
-                    lambda frame: apply_color_adjustments(
-                        frame,
-                        brightness=params['brightness'],
-                        contrast=params['contrast'],
-                        saturation=params['saturation'],
-                        temperature=params['temperature']
-                    )
-                )
-                output_filename = f"color_grade_{preset_name}_{int(time.time())}.mp4"
-            
-            elif custom_match:
-                try:
-                    brightness = float(custom_match.group(1))
-                    contrast = float(custom_match.group(2))
-                    saturation = float(custom_match.group(3))
-                    
-                    if not (0.0 <= brightness <= 3.0):
-                        raise ValueError("Brightness must be between 0.0 and 3.0")
-                    if not (0.0 <= contrast <= 3.0):
-                        raise ValueError("Contrast must be between 0.0 and 3.0")
-                    if not (0.0 <= saturation <= 3.0):
-                        raise ValueError("Saturation must be between 0.0 and 3.0")
-                    
-                    processed_clip = video.fl_image(
-                        lambda frame: apply_color_adjustments(
-                            frame,
-                            brightness=brightness,
-                            contrast=contrast,
-                            saturation=saturation
-                        )
-                    )
-                    output_filename = f"color_grade_custom_{int(time.time())}.mp4"
-                except Exception as e:
-                    raise ValueError(f"Custom color grading failed: {str(e)}")
-            else:
-                raise ValueError(f"Invalid color_grade format. Use presets or brightness/contrast/saturation")
-
-        # Speed Ramping
-        elif prompt.startswith('speed_ramp'):
-            match = re.search(r'start=([\d.]+)\s*end=([\d.]+)\s*factor=([\d.]+)', prompt)
-            if match:
-                start, end, factor = float(match.group(1)), float(match.group(2)), float(match.group(3))
-                
-                def speed_func(t):
-                    if t < start: return 1.0
-                    elif t > end: return factor
-                    else: return 1.0 + (factor - 1.0) * ((t - start) / (end - start))
-                
-                processed_clip = video.fl_time(lambda t: speed_func(t) * t)
-                processed_clip = processed_clip.set_duration(video.duration / speed_func(video.duration))
-                output_filename = f"speed_ramp_{int(time.time())}.mp4"
-
-        # Apply Effects
-        elif prompt.startswith('effect'):
-            match = re.search(r'type=(\w+)\s*strength=([\d.]+)', prompt)
-            if match:
-                effect_type = match.group(1).lower()
-                strength = float(match.group(2))
-                
-                if effect_type == 'freeze_frame':
-                    def freeze_effect(get_frame, t):
-                        frame = get_frame(t)
-                        if t >= strength:
-                            return frame
-                        return get_frame(strength)
-                    processed_clip = video.fl(freeze_effect)
-                    
-                elif effect_type == 'motion_blur':
-                    processed_clip = video.fx(vfx.motion_blur, blur=strength)
-                    
-                elif effect_type == 'gaussian_blur':
-                    processed_clip = video.fx(vfx.gaussian_blur, sigma=strength)
-                    
-                elif effect_type == 'sepia':
-                    def sepia_effect(frame):
-                        arr = frame * np.array([0.393, 0.769, 0.189])
-                        return np.clip(arr, 0, 255).astype('uint8')
-                    processed_clip = video.fl_image(sepia_effect)
-                    
-                elif effect_type == 'negative':
-                    processed_clip = video.fx(vfx.invert_colors)
-                    
-                elif effect_type == 'mirror':
-                    processed_clip = video.fx(vfx.mirror_x) if strength > 0.5 else video.fx(vfx.mirror_y)
-                    
-                elif effect_type == 'pixelate':
-                    def pixelate(frame):
-                        factor = max(1, int(strength))  # Ensure at least 1 and integer
-                        small = frame[::factor, ::factor]  # Downsample
-                        # Upsample with nearest neighbor
-                        return np.repeat(np.repeat(small, factor, axis=0), factor, axis=1)
-                    processed_clip = video.fl_image(pixelate)
-                    
-                elif effect_type == 'edge_detection':
-                    def edge_detect(frame):
-                        gray = np.mean(frame, axis=2)
-                        kernel = np.array([[-1,-1,-1], [-1,8,-1], [-1,-1,-1]])
-                        return cv2.filter2D(gray, -1, kernel)
-                    processed_clip = video.fl_image(edge_detect)
-                    
-                else:
-                    if effect_type == 'blur':
-                        processed_clip = video.fx(gaussian_blur, sigma=strength)
-                    elif effect_type == 'glow':
-                        processed_clip = apply_glow(video, intensity=strength/10)
-                    elif effect_type == 'vignette':
-                        processed_clip = apply_vignette(video, strength=strength/15)
-                        
-                output_filename = f"effect_{effect_type}_{int(time.time())}.mp4"
-
-        # Add Animations
-        elif prompt.startswith('animation'):
-            match = re.search(
-                r'type=(\w+)\s*start=([\d.]+)\s*end=([\d.]+)\s*' + 
-                r'(?:scale=([\d.]+))?\s*(?:angle=([\d.]+))?\s*' + 
-                r'(?:direction=(left|right|up|down))?',
-                prompt.lower()
-            )
-            if match:
-                anim_type = match.group(1).lower()
-                start, end = float(match.group(2)), float(match.group(3))
-                scale = float(match.group(4)) if match.group(4) else 1.5
-                angle = float(match.group(5)) if match.group(5) else 0
-                direction = match.group(6) if match.group(6) else 'right'
-
-                if anim_type == 'zoom':
-                    def zoom_effect(get_frame, t):
-                        frame = get_frame(t)
-                        if start <= t <= end:
-                            progress = (t - start) / (end - start)
-                            current_scale = 1 + (scale - 1) * progress
-                            
-                            # High-quality zoom implementation
-                            h, w = frame.shape[:2]
-                            center_x, center_y = w // 2, h // 2
-                            crop_w = int(w / current_scale)
-                            crop_h = int(h / current_scale)
-                            x1 = max(0, center_x - crop_w // 2)
-                            y1 = max(0, center_y - crop_h // 2)
-                            x2 = min(w, center_x + crop_w // 2)
-                            y2 = min(h, center_y + crop_h // 2)
-                            cropped = frame[y1:y2, x1:x2]
-                            frame = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LANCZOS4)
-                        return frame
-                    processed_clip = video.fl(zoom_effect)
-
-                elif anim_type == 'rotate':
-                    def rotate_effect(get_frame, t):
-                        frame = get_frame(t)
-                        if start <= t <= end:
-                            progress = (t - start) / (end - start)
-                            current_angle = angle * progress
-                            
-                            # Create temporary high-res version
-                            h, w = frame.shape[:2]
-                            temp = cv2.resize(frame, (w*2, h*2), interpolation=cv2.INTER_LANCZOS4)
-                            
-                            # Rotate the high-res version
-                            M = cv2.getRotationMatrix2D((w, h), current_angle, 1)
-                            rotated = cv2.warpAffine(temp, M, (w*2, h*2),
-                                              flags=cv2.INTER_LANCZOS4,
-                                              borderMode=cv2.BORDER_REPLICATE)
-                            
-                            # Crop back to original size
-                            frame = cv2.resize(rotated[h//2:h+h//2, w//2:w+w//2], (w, h),
-                                          interpolation=cv2.INTER_LANCZOS4)
-                            
-                            # Apply slight sharpening
-                            kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]]) / 4.0
-                            frame = cv2.filter2D(frame, -1, kernel)
-                        return frame
-                    
-                    processed_clip = video.fl(rotate_effect)
-
-                elif anim_type == 'slide':
-                    def slide_effect(get_frame, t):
-                        frame = get_frame(t)
-                        if start <= t <= end:
-                            progress = (t - start) / (end - start)
-                            offset = int(progress * video.w)
-                            if direction == 'left':
-                                frame = np.roll(frame, -offset, axis=1)
-                            elif direction == 'right':
-                                frame = np.roll(frame, offset, axis=1)
-                            elif direction == 'up':
-                                frame = np.roll(frame, -offset, axis=0)
-                            else:  # down
-                                frame = np.roll(frame, offset, axis=0)
-                        return frame
-                    processed_clip = video.fl(slide_effect)
-
-                elif anim_type == 'fade':
-                    def fade_effect(get_frame, t):
-                        frame = get_frame(t)
-                        if start <= t <= end:
-                            progress = (t - start) / (end - start)
-                            if 'in' in prompt.lower():
-                                frame = (frame * progress).astype('uint8')
-                            else:  # fade out
-                                frame = (frame * (1 - progress)).astype('uint8')
-                        return frame
-                    processed_clip = video.fl(fade_effect)
-
-                elif anim_type == 'bounce':
-                    def bounce_effect(get_frame, t):
-                        frame = get_frame(t)
-                        if start <= t <= end:
-                            progress = (t - start) / (end - start)
-                        # Bounce easing function using math.sin
-                            bounce_progress = abs(math.sin(progress * math.pi * 3)) * (1 - progress)
-                            offset = int(bounce_progress * video.h * 0.1)
-                            frame = np.roll(frame, -offset, axis=0)
-                        return frame
-                    processed_clip = video.fl(bounce_effect)
-
-                output_filename = f"animation_{anim_type}_{int(time.time())}.mp4"
-        elif prompt.startswith('overlay'):
-                try:
-                        # Parse the overlay command
-                        match = re.search(
-                                r'overlay\s+type=(text|image|video)\s+'
-                                r'(?:content="([^"]+)"\s+)?'
-                                r'(?:path="([^"]+)"\s+)?'
-                                r'x=(\d+)\s+y=(\d+)\s+'
-                                r'(?:duration=([\d.]+)\s+)?'
-                                r'(?:position=(top|bottom|center|left|right|center-left|center-right)\s+)?'
-                                r'(?:opacity=([\d.]+)\s+)?'
-                                r'(?:volume=([\d.]+)\s+)?'
-                                r'(?:color=(\w+)\s+)?'
-                                r'(?:fontsize=(\d+)\s+)?',
-                                prompt
-                        )
-
-                        if not match:
-                                raise ValueError("Invalid overlay command format")
-
-                        overlay_type = match.group(1)
-                        x, y = int(match.group(4)), int(match.group(5))
-                        duration = float(match.group(6)) if match.group(6) else None
-                        position = match.group(7) or 'top-left'
-
-                        if overlay_type == 'text':
-                                content = match.group(2)
-                                color = match.group(10) or 'white'
-                                fontsize = int(match.group(11)) if match.group(11) else 50
-                                
-                                txt_clip = TextClip(
-                                        content,
-                                        fontsize=fontsize,
-                                        color=color,
-                                        stroke_color='black',
-                                        stroke_width=1
-                                )
-                                duration = duration if duration else video.duration
-                                txt_clip = txt_clip.set_pos((x, y)).set_duration(duration)
-                                processed_clip = CompositeVideoClip([video, txt_clip])
-
-                        elif overlay_type == 'video':
-                                filename = match.group(3)
-                                if not filename:
-                                        raise ValueError("Path parameter is required for video overlay")
-                                
-                                # Video file handling (unchanged)
-                                path = filename
-                                if not os.path.exists(path):
-                                        auxiliary_path = os.path.join('auxiliary', filename)
-                                        if os.path.exists(auxiliary_path):
-                                                path = auxiliary_path
-                                        else:
-                                                uploads_path = os.path.join('uploads', filename)
-                                                if os.path.exists(uploads_path):
-                                                        path = uploads_path
-                                
-                                if not os.path.exists(path):
-                                        raise ValueError(f"Video file not found: {filename}")
-                                
-                                volume = float(match.group(9)) if match.group(9) else 1.0
-                                overlay_video = VideoFileClip(path)
-                                if volume != 1.0:
-                                        overlay_video = overlay_video.volumex(volume)
-                                if duration and duration < overlay_video.duration:
-                                        overlay_video = overlay_video.subclip(0, duration)
-                                overlay_video = overlay_video.set_pos((x, y))
-                                processed_clip = CompositeVideoClip([video, overlay_video])
-
-                        elif overlay_type == 'image':
-                                filename = match.group(3)
-                                if not filename:
-                                        raise ValueError("Image filename is required (e.g., 'logo.jpg')")
-                                
-                                # Get the ACTUAL path from the selected auxiliary file
-                                if not hasattr(app, 'selected_auxiliary_file'):
-                                        raise ValueError("No auxiliary file selected. Please select an image file first.")
-                                
-                                if not os.path.exists(app.selected_auxiliary_file):
-                                        raise ValueError(f"Selected file not found. Please re-upload '{filename}' via Auxiliary Files.")
-                                
-                                opacity = float(match.group(8)) if match.group(8) else 1.0
-                                img_clip = ImageClip(app.selected_auxiliary_file).set_opacity(opacity)
-                                duration = duration if duration else video.duration
-                                img_clip = img_clip.set_pos((x, y)).set_duration(duration)
-                                processed_clip = CompositeVideoClip([video, img_clip])
-
-                        else:
-                                raise ValueError("Invalid overlay type")
-
-                        output_filename = f"overlay_{int(time.time())}.mp4"
-                        processed_clip.write_videofile(output_filename, codec='libx264', audio_codec='aac')
-                        
-                except Exception as e:
-                        raise ValueError(f"Overlay processing failed: {str(e)}")                
-
-        elif prompt.startswith('merge_videos'):
-            try:
-                match = re.search(r'files=([^\s]+(?:,[^\s]+)*)', prompt)
-                if not match:
-                    raise ValueError("Invalid merge format. Example: 'merge_videos files=clip2.mp4,clip3.mp4'")
-                
-                files = [f.strip() for f in match.group(1).split(',')]
-                main_video_name = os.path.basename(input_path)
-                # Avoid duplicating the main video if it's listed in files
-                clips = [video] if main_video_name not in files else []
-
-                # Load and validate additional clips
-                for f in files:
-                    file_path = os.path.join(app.config['UPLOAD_FOLDER'], f) if not os.path.isabs(f) else f
-                    print(f"Trying to load: {file_path}")  # Debug print
-                    if not os.path.exists(file_path):
-                        raise ValueError(f"File not found: {f} (Looked in: {file_path})")
-                    try:
-                        clip = VideoFileClip(file_path)
-                        if clip is None or not hasattr(clip, 'get_frame'):
-                            raise ValueError(f"Failed to load video file: {f}")
-                        print(f"Loaded {f}: duration={clip.duration}, size={clip.size}")  # Debug print
-                        clips.append(clip)
-                    except Exception as e:
-                        raise ValueError(f"Invalid video file {f}: {str(e)}")
-
-                if len(clips) < 2:
-                    raise ValueError("At least two videos are required for merging.")
-
-                # Ensure all clips have the same size
-                target_w = max(c.w for c in clips)
-                target_h = max(c.h for c in clips)
-                target_size = (target_w, target_h)
-                for i, c in enumerate(clips):
-                    if (c.w, c.h) != target_size:
-                        clips[i] = c.resize(newsize=target_size)
-
-                # Transition handling
-                transition_match = re.search(r'transition=(\w+)\s+duration=([\d.]+)', prompt)
-                if transition_match:
-                    transition_type = transition_match.group(1).lower()
-                    transition_duration = float(transition_match.group(2))
-                    final_clips = [clips[0]]
-                    for i in range(1, len(clips)):
-                        if transition_type == 'crossfade':
-                            final_clips.append(clips[i].crossfadein(transition_duration))
-                        else:
-                            final_clips.append(clips[i])
-                    processed_clip = concatenate_videoclips(final_clips, method="compose")
-                else:
-                    processed_clip = concatenate_videoclips(clips, method="compose")
-
-                output_filename = f"merged_{int(time.time())}.mp4"
-                output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
-                processed_clip.write_videofile(
-                    output_path,
-                    codec='libx264',
-                    audio_codec='aac',
-                    threads=4,
-                    preset='fast',
-                    ffmpeg_params=['-crf', '23']
-                )
-
-                # Verify output was created
-                if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-                    raise RuntimeError("Output file not generated")
-                
-                return {'success': True, 'output_file': output_filename}
-
-            except Exception as e:
-                raise ValueError(f"Video processing error: {str(e)}")
-            finally:
-                # Close all loaded clips except the main video (already closed in outer finally)
-                for clip in clips[1:] if len(clips) > 1 else []:
-                    try:
-                        clip.close()
-                    except Exception:
-                        pass
-                if 'processed_clip' in locals():
-                    try:
-                        processed_clip.close()
-                    except Exception:
-                        pass
-        # Add Transition (for single video)
-        elif prompt.startswith('transition'):
-            match = re.search(r'type=(\w+)\s+duration=([\d.]+)', prompt)
-            if match:
-                transition_type = match.group(1).lower()
-                duration = float(match.group(2))
-                
-                if transition_type == 'crossfade':
-                    # Split video into two parts and crossfade them
-                    if video.duration < duration * 2:
-                        raise ValueError("Video too short for this transition")
-                    
-                    clip1 = video.subclip(0, video.duration - duration)
-                    clip2 = video.subclip(video.duration - duration)
-                    clip2 = clip2.crossfadein(duration)
-                    processed_clip = CompositeVideoClip([clip1, clip2.set_start(clip1.duration - duration)])
-                
-                elif transition_type == 'fade':
-                    processed_clip = video.fadein(duration/2).fadeout(duration/2)
-                
-                elif transition_type == 'slide':
-                    direction = 'right'
-                    dir_match = re.search(r'direction=(\w+)', prompt)
-                    if dir_match:
-                        direction = dir_match.group(1).lower()
-                    
-                    def slide_effect(get_frame, t):
-                        frame = get_frame(t)
-                        h, w = frame.shape[:2]
-                        offset = 0
-                        
-                        if t < duration:  # Slide in
-                            progress = t / duration
-                            if direction == 'right':
-                                offset = int(w * (1 - progress))
-                            elif direction == 'left':
-                                offset = int(-w * (1 - progress))
-                            elif direction == 'up':
-                                offset = int(-h * (1 - progress))
-                            elif direction == 'down':
-                                offset = int(h * (1 - progress))
-                        
-                        elif t > video.duration - duration:  # Slide out
-                            progress = (t - (video.duration - duration)) / duration
-                            if direction == 'right':
-                                offset = int(w * progress)
-                            elif direction == 'left':
-                                offset = int(-w * progress)
-                            elif direction == 'up':
-                                offset = int(-h * progress)
-                            elif direction == 'down':
-                                offset = int(h * progress)
-                            
-                        if direction in ['left', 'right']:
-                            return np.roll(frame, offset, axis=1)
-                        else:
-                            return np.roll(frame, offset, axis=0)
-                    
-                    processed_clip = video.fl(slide_effect)
-                
-                output_filename = f"transition_{transition_type}_{int(time.time())}.mp4"
-
-        else:
-            raise ValueError(f"Unknown command. Supported: {', '.join(SUPPORTED_COMMANDS)}")
-
-        # Save processed video
-        if output_filename:
-            output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
-            processed_clip.write_videofile(
-                output_path,
-                codec='libx264',
-                audio_codec='aac',
-                threads=4,
-                preset='fast',
-                ffmpeg_params=['-crf', '23']
-            )
-            
-            # Verify output was created
-            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-                raise RuntimeError("Output file not generated")
-            
-            return {'success': True, 'output_file': output_filename}
-        else:
-            raise ValueError("Processing failed - no output generated")
-
-    except Exception as e:
-        raise ValueError(f"Video processing error: {str(e)}")
-    finally:
-        if video:
-            video.close()
-
-
 
 if __name__ == '__main__':
     # Create a test user if none exists
@@ -2999,4 +5633,4 @@ if __name__ == '__main__':
             print("Test user created successfully")  # Debug print
     
     print("Starting Flask application...")  # Debug print
-    app.run(host='0.0.0.0', port=5000, debug=True)  # Allow external access
+    app.run(debug=True, port=5000) 

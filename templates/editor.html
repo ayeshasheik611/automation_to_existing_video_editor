@@ -471,21 +471,69 @@
                 <div class="prompt-section">
                     <h3>Text Commands</h3>
                     <div class="prompt-input">
-                        <input type="text" id="promptInput" placeholder="Enter your command (e.g., 'trim 10 to 20', 'speed 1.5x', 'resize to 1920x1080')" class="form-control">
+                        <input type="text" id="promptInput" placeholder="Enter your command (e.g., 'trim start=10 end=30', 'speed factor=1.5', 'color_grade preset=cinematic')" class="form-control">
                         <button onclick="processPrompt()" class="btn btn-primary">Process</button>
                     </div>
                     <div class="prompt-help">
-                        <h4>Available Commands:</h4>
-                        <ul>
-                            <li>trim [start] to [end] - Trim video between timestamps</li>
-                            <li>speed [factor]x - Change video speed</li>
-                            <li>resize to [width]x[height] - Resize video</li>
-                            <li>extract audio - Extract audio from video</li>
-                            <li>add [type] transition for [duration]s - Add transition effect</li>
-                            <li>apply [style] color grading - Apply color grading</li>
-                            <li>add [type] effect - Add special effect</li>
-                            <li>add [type] animation for [duration]s - Add animation</li>
-                        </ul>
+                        <h4>Available Commands: <button class="btn btn-sm btn-info" onclick="showPromptHelp()">Show All Commands</button></h4>
+                        <div id="basicCommands">
+                            <strong>Basic Operations:</strong>
+                            <ul>
+                                <li><code>trim start=10 end=30</code> - Trim video from 10s to 30s</li>
+                                <li><code>resize width=1920 height=1080</code> - Resize to 1920x1080</li>
+                                <li><code>speed factor=2.0</code> - Change speed (2x faster)</li>
+                                <li><code>extract_audio format=mp3</code> - Extract audio as MP3</li>
+                            </ul>
+                            <strong>Effects & Color:</strong>
+                            <ul>
+                                <li><code>color_grade preset=cinematic</code> - Apply color preset</li>
+                                <li><code>effect type=blur strength=2</code> - Apply blur effect</li>
+                                <li><code>overlay type=text content="Hello" position=center</code> - Add text</li>
+                            </ul>
+                        </div>
+                        <div id="allCommands" style="display: none;">
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <strong>Basic Operations:</strong>
+                                    <ul style="font-size: 0.85em;">
+                                        <li><code>trim start=X end=Y</code></li>
+                                        <li><code>resize width=X height=Y</code></li>
+                                        <li><code>speed factor=X</code></li>
+                                        <li><code>extract_audio format=mp3|wav</code></li>
+                                    </ul>
+                                    <strong>Color & Effects:</strong>
+                                    <ul style="font-size: 0.85em;">
+                                        <li><code>color_grade preset=cinematic|vintage|warm|cool|noir|vibrant</code></li>
+                                        <li><code>color_grade brightness=X contrast=Y saturation=Z</code></li>
+                                        <li><code>effect type=blur|sepia|negative|mirror|pixelate|edge_detection strength=X</code></li>
+                                        <li><code>speed_ramp start=X end=Y factor=Z</code></li>
+                                    </ul>
+                                </div>
+                                <div class="col-md-6">
+                                    <strong>Animation & Text:</strong>
+                                    <ul style="font-size: 0.85em;">
+                                        <li><code>animation type=zoom|pan|fade|rotate start=X end=Y scale=Z</code></li>
+                                        <li><code>animation type=pan direction=left|right|up|down</code></li>
+                                        <li><code>overlay type=text content="Text" position=center|top|bottom</code></li>
+                                        <li><code>overlay type=text content="Text" x=X y=Y duration=W</code></li>
+                                    </ul>
+                                    <strong>Multi-Video Commands:</strong>
+                                    <ul style="font-size: 0.85em;">
+                                        <li><code>merge_videos transition=fade duration=2</code> (requires multiple files)</li>
+                                        <li><code>transition type=dissolve duration=1.5</code> (requires multiple files)</li>
+                                        <li><em>Use Multi Video Editor for multi-file operations</em></li>
+                                    </ul>
+                                    <strong>Examples:</strong>
+                                    <ul style="font-size: 0.85em;">
+                                        <li><code>trim start=5 end=15</code></li>
+                                        <li><code>speed factor=1.5</code></li>
+                                        <li><code>color_grade preset=cinematic</code></li>
+                                        <li><code>effect type=blur strength=3</code></li>
+                                        <li><code>overlay type=text content="My Video" position=bottom</code></li>
+                                    </ul>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -1195,6 +1243,24 @@ if (!contentType || !contentType.includes('application/json')) {
         updateProgress(0, `Error: ${error.message}`);
     }
 }
+
+        function showPromptHelp() {
+            const basicCommands = document.getElementById('basicCommands');
+            const allCommands = document.getElementById('allCommands');
+            const button = event.target;
+            
+            if (allCommands.style.display === 'none') {
+                basicCommands.style.display = 'none';
+                allCommands.style.display = 'block';
+                button.textContent = 'Show Basic Commands';
+                button.className = 'btn btn-sm btn-secondary';
+            } else {
+                basicCommands.style.display = 'block';
+                allCommands.style.display = 'none';
+                button.textContent = 'Show All Commands';
+                button.className = 'btn btn-sm btn-info';
+            }
+        }
 
         function handleMainVideoUpload(input) {
             const file = input.files[0];
